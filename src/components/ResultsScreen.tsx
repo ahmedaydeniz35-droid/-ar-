@@ -4,22 +4,29 @@ import {
   ArrowRight,
   Check,
   Copy,
+  LogOut,
   RefreshCw,
   Shuffle,
 } from 'lucide-react';
-import { SentenceResult } from '../types/game';
-import { FourColumnBar } from './FourColumnBar';
+import type { SentenceResult } from '../types/game.ts';
+import { FourColumnBar } from './FourColumnBar.tsx';
 
 interface ResultsScreenProps {
   results: SentenceResult[];
+  isOnline?: boolean;
+  isHost?: boolean;
   onReshuffle: () => void;
   onPlayAgain: () => void;
+  onLeaveRoom?: () => void;
 }
 
 export function ResultsScreen({
   results,
+  isOnline = false,
+  isHost = true,
   onReshuffle,
   onPlayAgain,
+  onLeaveRoom,
 }: ResultsScreenProps) {
   const [currentIndex, setCurrentIndex] = useState(0);
   const [showAll, setShowAll] = useState(false);
@@ -57,6 +64,7 @@ export function ResultsScreen({
   };
 
   const activeItem = results[currentIndex];
+  const canControlRound = !isOnline || isHost;
 
   return (
     <div className="flex flex-col justify-between gap-6">
@@ -69,15 +77,17 @@ export function ResultsScreen({
           </h2>
 
           <div className="flex items-center gap-2">
-            <button
-              type="button"
-              onClick={onReshuffle}
-              title="Aynı cevapları tekrar karıştır"
-              className="flex h-11 items-center gap-1.5 rounded-xl border border-slate-200 bg-white px-3.5 text-sm font-semibold text-[#0F172A] transition-colors hover:bg-slate-50 active:scale-[0.98] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#4338CA] whitespace-nowrap shrink-0"
-            >
-              <Shuffle className="h-4 w-4 text-[#4338CA]" aria-hidden="true" />
-              <span>Karıştır</span>
-            </button>
+            {canControlRound && (
+              <button
+                type="button"
+                onClick={onReshuffle}
+                title="Aynı cevapları tekrar karıştır"
+                className="flex h-11 items-center gap-1.5 rounded-xl border border-slate-200 bg-white px-3.5 text-sm font-semibold text-[#0F172A] transition-colors hover:bg-slate-50 active:scale-[0.98] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#4338CA] whitespace-nowrap shrink-0"
+              >
+                <Shuffle className="h-4 w-4 text-[#4338CA]" aria-hidden="true" />
+                <span>Karıştır</span>
+              </button>
+            )}
 
             <div className="flex items-center rounded-xl bg-slate-200/70 p-1">
               <button
@@ -221,14 +231,32 @@ export function ResultsScreen({
         </div>
       </div>
 
-      <button
-        type="button"
-        onClick={onPlayAgain}
-        className="flex h-14 w-full items-center justify-center gap-2 rounded-2xl bg-[#0F172A] px-6 text-base font-bold text-white transition-all duration-150 hover:bg-slate-800 active:scale-[0.99] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#0F172A] focus-visible:ring-offset-2 whitespace-nowrap shrink-0"
-      >
-        <RefreshCw className="h-5 w-5" aria-hidden="true" />
-        <span>Yeni Oyun</span>
-      </button>
+      {canControlRound ? (
+        <button
+          type="button"
+          onClick={onPlayAgain}
+          className="flex h-14 w-full items-center justify-center gap-2 rounded-2xl bg-[#0F172A] px-6 text-base font-bold text-white transition-all duration-150 hover:bg-slate-800 active:scale-[0.99] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#0F172A] focus-visible:ring-offset-2 whitespace-nowrap shrink-0"
+        >
+          <RefreshCw className="h-5 w-5" aria-hidden="true" />
+          <span>Yeni Oyun</span>
+        </button>
+      ) : (
+        <div className="space-y-2.5">
+          <p className="text-center text-sm font-medium text-[#64748B]">
+            Yeni turu oda yöneticisi başlatabilir.
+          </p>
+          {onLeaveRoom && (
+            <button
+              type="button"
+              onClick={onLeaveRoom}
+              className="flex h-12 w-full items-center justify-center gap-2 rounded-2xl border border-slate-200 bg-white px-5 text-sm font-semibold text-[#64748B] transition-colors hover:bg-slate-50 hover:text-[#0F172A] whitespace-nowrap shrink-0"
+            >
+              <LogOut className="h-4 w-4" aria-hidden="true" />
+              <span>Odadan Ayrıl</span>
+            </button>
+          )}
+        </div>
+      )}
     </div>
   );
 }

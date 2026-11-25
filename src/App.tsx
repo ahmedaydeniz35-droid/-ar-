@@ -1,19 +1,32 @@
-import { useEffect, useState } from 'react';
-import { HelpCircle, RotateCcw, Volume2, VolumeX, X } from 'lucide-react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
+  Globe,
+  HelpCircle,
+  LogOut,
+  RotateCcw,
+  Smartphone,
+  Volume2,
+  VolumeX,
+  X,
+} from 'lucide-react';
+import { GAME_STEPS } from './types/game.ts';
+import type {
   AnswersMap,
-  GAME_STEPS,
   Player,
+  PlayMode,
   ScreenState,
   SentenceResult,
-} from './types/game';
-import { buildSentences, createEmptyAnswers } from './utils/shuffler';
-import { soundFx } from './utils/sound';
-import { LobbyScreen } from './components/LobbyScreen';
-import { PlayScreen } from './components/PlayScreen';
-import { ShuffleScreen } from './components/ShuffleScreen';
-import { ResultsScreen } from './components/ResultsScreen';
-import { RoundSidebar } from './components/RoundSidebar';
+} from './types/game.ts';
+import { buildSentences, createEmptyAnswers } from './utils/shuffler.ts';
+import { soundFx } from './utils/sound.ts';
+import { useMultiplayerRoom } from './hooks/useMultiplayerRoom.ts';
+import { FourColumnBar } from './components/FourColumnBar.tsx';
+import { LobbyScreen } from './components/LobbyScreen.tsx';
+import { OnlineLobby } from './components/OnlineLobby.tsx';
+import { PlayScreen } from './components/PlayScreen.tsx';
+import { ShuffleScreen } from './components/ShuffleScreen.tsx';
+import { ResultsScreen } from './components/ResultsScreen.tsx';
+import { RoundSidebar } from './components/RoundSidebar.tsx';
 
 function createPlayerId(): string {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
@@ -23,26 +36,81 @@ function createPlayerId(): string {
 }
 
 export default function App() {
-  const [screen, setScreen] = useState<ScreenState>('LOBBY');
+  const initialQuery = useMemo(() => {
+    if (typeof window === 'undefined') {
+      return { roomCode: '', autostart: false };
+    }
+    const params = new URLSearchParams(window.location.search);
+    return {
+      roomCode: (params.get('room') ?? '').trim().toUpperCase(),
+      autostart: params.get('autostart') === '1',
+    };
+  }, []);
+
+  const [mode, setMode] = useState<PlayMode>(() =>
+    initialQuery.autostart && !initialQuery.roomCode ? 'LOCAL' : 'ONLINE'
+  );
+
+  // Local pass-and-play state
+  const [screen, setScreen] = useState<ScreenState>(() =>
+    initialQuery.autostart && !initialQuery.roomCode ? 'PLAYING' : 'LOBBY'
+  );
   const [players, setPlayers] = useState<Player[]>(() => [
     { id: createPlayerId(), name: '1. Kişi' },
     { id: createPlayerId(), name: '2. Kişi' },
   ]);
-
   const [currentStepIndex, setCurrentStepIndex] = useState(0);
   const [currentPlayerIndex, setCurrentPlayerIndex] = useState(0);
   const [inputText, setInputText] = useState('');
   const [isHiddenLocked, setIsHiddenLocked] = useState(false);
-
   const [answers, setAnswers] = useState<AnswersMap>(createEmptyAnswers);
   const [results, setResults] = useState<SentenceResult[]>([]);
+
+  // Online multiplayer state
+  const mp = useMultiplayerRoom(mode === 'ONLINE');
+  const [onlineInputText, setOnlineInputText] = useState('');
 
   const [soundEnabled, setSoundEnabled] = useState(true);
   const [rulesOpen, setRulesOpen] = useState(false);
 
-  // Handle the 850ms hidden-lock transition before advancing player or entering shuffle
+  const prevRoomScreenRef = useRef<ScreenState | null>(null);
+  const prevRoomStepRef = useRef<number>(-1);
+
+  // Clear online input when step or screen changes, and trigger sound cues
   useEffect(() => {
-    if (screen !== 'PLAYING' || !isHiddenLocked) return;
+    if (!mp.room) {
+      prevRoomScreenRef.current = null;
+      prevRoomStepRef.current = -1;
+      setOnlineInputText('');
+      return;
+    }
+
+    const prevScreen = prevRoomScreenRef.current;
+    const prevStep = prevRoomStepRef.current;
+
+    if (
+      prevScreen !== mp.room.screen ||
+      prevStep !== mp.room.currentStepIndex
+    ) {
+      if (mp.room.screen === 'PLAYING') {
+        setOnlineInputText('');
+      }
+      if (prevScreen && prevScreen !== mp.room.screen) {
+        if (mp.room.screen === 'SHUFFLING') {
+          soundFx.shuffle(soundEnabled);
+        } else if (mp.room.screen === 'RESULTS') {
+          soundFx.reveal(soundEnabled);
+        }
+      }
+    }
+
+    prevRoomScreenRef.current = mp.room.screen;
+    prevRoomStepRef.current = mp.room.currentStepIndex;
+  }, [mp.room, soundEnabled]);
+
+  // Local mode: 850ms hidden-lock transition before advancing player or entering shuffle
+  useEffect(() => {
+    if (mode !== 'LOCAL' || screen !== 'PLAYING' || !isHiddenLocked) return;
 
     const timer = window.setTimeout(() => {
       setIsHiddenLocked(false);
@@ -57,11 +125,11 @@ export default function App() {
     }, 850);
 
     return () => window.clearTimeout(timer);
-  }, [screen, isHiddenLocked, currentPlayerIndex, players.length, soundEnabled]);
+  }, [mode, screen, isHiddenLocked, currentPlayerIndex, players.length, soundEnabled]);
 
-  // Handle the 1400ms shuffle screen before advancing step or revealing results
+  // Local mode: 1400ms shuffle screen before advancing step or revealing results
   useEffect(() => {
-    if (screen !== 'SHUFFLING') return;
+    if (mode !== 'LOCAL' || screen !== 'SHUFFLING') return;
 
     const timer = window.setTimeout(() => {
       if (currentStepIndex + 1 < GAME_STEPS.length) {
@@ -77,7 +145,7 @@ export default function App() {
     }, 1400);
 
     return () => window.clearTimeout(timer);
-  }, [screen, currentStepIndex, players, answers, soundEnabled]);
+  }, [mode, screen, currentStepIndex, players, answers, soundEnabled]);
 
   const handleAddPlayer = (name: string) => {
     const trimmed = name.trim();
@@ -146,23 +214,98 @@ export default function App() {
     setScreen('LOBBY');
   };
 
-  const activeStep = GAME_STEPS[currentStepIndex] ?? GAME_STEPS[0];
-  const activePlayer = players[currentPlayerIndex] ?? players[0];
+  const handleOnlineConfirm = () => {
+    const trimmed = onlineInputText.trim();
+    if (!trimmed) return;
+    soundFx.lock(soundEnabled);
+    mp.submitAnswer(trimmed);
+  };
+
+  const handleOnlineReshuffle = () => {
+    soundFx.shuffle(soundEnabled);
+    mp.reshuffle();
+  };
+
+  const handleOnlineReset = () => {
+    soundFx.tap(soundEnabled);
+    mp.resetToLobby();
+  };
+
+  const isOnline = mode === 'ONLINE';
+  const onlineRoom = mp.room;
+  const effectiveScreen: ScreenState = isOnline
+    ? (onlineRoom?.screen ?? 'LOBBY')
+    : screen;
+  const effectiveStepIndex = isOnline
+    ? (onlineRoom?.currentStepIndex ?? 0)
+    : currentStepIndex;
+  const activeStep = GAME_STEPS[effectiveStepIndex] ?? GAME_STEPS[0];
+
+  const activeLocalPlayer = players[currentPlayerIndex] ?? players[0];
+  const onlineSelfPlayer =
+    onlineRoom?.players.find((p) => p.id === mp.myPlayerId) ??
+    onlineRoom?.players[0];
+  const onlineHasSubmitted = Boolean(
+    onlineRoom &&
+      mp.myPlayerId &&
+      onlineRoom.submittedPlayerIds.includes(mp.myPlayerId)
+  );
+  const isOnlineHost = Boolean(
+    onlineRoom && mp.myPlayerId && onlineRoom.hostId === mp.myPlayerId
+  );
 
   return (
-    <div className="min-h-screen bg-[#F6F7FB] text-[#0F172A] flex flex-col">
+    <div
+      className="min-h-screen bg-[#F6F7FB] text-[#0F172A] flex flex-col"
+      data-game-mode={mode}
+      data-game-screen={effectiveScreen}
+    >
       <header className="border-b border-slate-200/80 bg-white">
         <div className="mx-auto flex h-14 max-w-5xl items-center justify-between gap-4 px-4 sm:px-6">
-          <button
-            type="button"
-            onClick={handlePlayAgain}
-            className="font-display text-base sm:text-lg font-extrabold tracking-tight text-[#0F172A] whitespace-nowrap shrink-0 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#4338CA] rounded-md"
-          >
-            Kim, Kiminle, Nerede?
-          </button>
+          <div className="flex items-center gap-2.5 min-w-0">
+            <button
+              type="button"
+              onClick={() => {
+                if (!isOnline) {
+                  handlePlayAgain();
+                } else if (onlineRoom && isOnlineHost && onlineRoom.screen !== 'LOBBY') {
+                  handleOnlineReset();
+                }
+              }}
+              className="font-display text-base sm:text-lg font-extrabold tracking-tight text-[#0F172A] whitespace-nowrap shrink-0 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#4338CA] rounded-md"
+            >
+              Kim, Kiminle, Nerede?
+            </button>
+
+            {isOnline && onlineRoom && (
+              <span className="hidden sm:inline-flex items-center gap-1.5 rounded-lg bg-[#EEF2FF] px-2.5 py-1 font-mono text-xs font-bold text-[#4338CA] whitespace-nowrap shrink-0">
+                <span
+                  aria-hidden="true"
+                  className={`h-2 w-2 rounded-full ${
+                    mp.connectionStatus === 'connected'
+                      ? 'bg-[#16A34A]'
+                      : 'bg-amber-500'
+                  }`}
+                />
+                Oda: {onlineRoom.code}
+              </span>
+            )}
+          </div>
 
           <div className="flex items-center gap-1 sm:gap-2 shrink-0">
-            {screen !== 'LOBBY' && (
+            {isOnline && onlineRoom && (
+              <button
+                type="button"
+                onClick={mp.leaveRoom}
+                aria-label="Odadan çık"
+                className="flex h-11 items-center gap-1.5 rounded-xl px-3 text-xs sm:text-sm font-semibold text-[#64748B] transition-colors hover:bg-slate-100 hover:text-[#0F172A] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#4338CA] whitespace-nowrap shrink-0"
+              >
+                <LogOut className="h-4 w-4" aria-hidden="true" />
+                <span className="hidden sm:inline">Ayrıl</span>
+              </button>
+            )}
+
+            {!isOnline && screen !== 'LOBBY' && (
               <button
                 type="button"
                 onClick={handlePlayAgain}
@@ -203,51 +346,162 @@ export default function App() {
       <main className="mx-auto w-full max-w-5xl flex-1 px-4 py-5 sm:px-6 sm:py-8">
         <div className="grid grid-cols-1 gap-8 lg:grid-cols-12 lg:items-start">
           <section className="lg:col-span-7" aria-label="Oyun alanı">
-            {screen === 'LOBBY' && (
-              <LobbyScreen
-                players={players}
-                onAddPlayer={handleAddPlayer}
-                onRenamePlayer={handleRenamePlayer}
-                onRemovePlayer={handleRemovePlayer}
-                onStartGame={handleStartGame}
-              />
+            {effectiveScreen === 'LOBBY' && (
+              <div className="space-y-5">
+                <div>
+                  <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
+                    <div>
+                      <h1 className="font-display text-2xl sm:text-3xl font-extrabold tracking-tight text-[#0F172A] text-balance">
+                        Kim, Kiminle, Nerede?
+                      </h1>
+                      <p className="mt-1.5 text-sm sm:text-base text-[#64748B]">
+                        {isOnline
+                          ? 'Oda kur veya kodla katıl, herkes kendi cihazından gizlice yazsın.'
+                          : 'Kişileri ekle, telefonu sırayla dolaştır.'}
+                      </p>
+                    </div>
+                  </div>
+
+                  {(!isOnline || !onlineRoom) && (
+                    <div
+                      className="mb-4 grid grid-cols-2 gap-1.5 rounded-2xl bg-slate-200/70 p-1.5"
+                      role="tablist"
+                      aria-label="Oyun modu"
+                    >
+                      <button
+                        type="button"
+                        role="tab"
+                        aria-selected={isOnline}
+                        onClick={() => {
+                          soundFx.tap(soundEnabled);
+                          setMode('ONLINE');
+                        }}
+                        className={`flex h-11 items-center justify-center gap-2 rounded-xl px-3 text-sm font-bold transition-colors whitespace-nowrap ${
+                          isOnline
+                            ? 'bg-white text-[#0F172A] shadow-xs'
+                            : 'text-[#64748B] hover:text-[#0F172A]'
+                        }`}
+                      >
+                        <Globe className="h-4 w-4 text-[#4338CA]" aria-hidden="true" />
+                        <span>Çevrimiçi Oda</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        role="tab"
+                        aria-selected={!isOnline}
+                        onClick={() => {
+                          soundFx.tap(soundEnabled);
+                          setMode('LOCAL');
+                        }}
+                        className={`flex h-11 items-center justify-center gap-2 rounded-xl px-3 text-sm font-bold transition-colors whitespace-nowrap ${
+                          !isOnline
+                            ? 'bg-white text-[#0F172A] shadow-xs'
+                            : 'text-[#64748B] hover:text-[#0F172A]'
+                        }`}
+                      >
+                        <Smartphone className="h-4 w-4 text-[#4338CA]" aria-hidden="true" />
+                        <span>Tek Cihaz</span>
+                      </button>
+                    </div>
+                  )}
+
+                  <FourColumnBar activeStepIndex={0} />
+                </div>
+
+                {isOnline ? (
+                  <OnlineLobby
+                    connectionStatus={mp.connectionStatus}
+                    room={onlineRoom}
+                    myPlayerId={mp.myPlayerId}
+                    initialRoomCode={initialQuery.roomCode}
+                    error={mp.error}
+                    onClearError={mp.clearError}
+                    onCreateRoom={mp.createRoom}
+                    onJoinRoom={mp.joinRoom}
+                    onLeaveRoom={mp.leaveRoom}
+                    onRenamePlayer={mp.renamePlayer}
+                    onKickPlayer={mp.kickPlayer}
+                    onStartGame={mp.startGame}
+                  />
+                ) : (
+                  <LobbyScreen
+                    players={players}
+                    onAddPlayer={handleAddPlayer}
+                    onRenamePlayer={handleRenamePlayer}
+                    onRemovePlayer={handleRemovePlayer}
+                    onStartGame={handleStartGame}
+                  />
+                )}
+              </div>
             )}
 
-            {screen === 'PLAYING' && activePlayer && (
-              <PlayScreen
-                step={activeStep}
-                player={activePlayer}
-                playerIndex={currentPlayerIndex}
-                totalPlayers={players.length}
-                inputText={inputText}
-                isHiddenLocked={isHiddenLocked}
-                onInputChange={setInputText}
-                onConfirmTick={handleConfirmTick}
-              />
-            )}
+            {effectiveScreen === 'PLAYING' &&
+              (isOnline ? (
+                onlineRoom &&
+                onlineSelfPlayer && (
+                  <PlayScreen
+                    mode="ONLINE"
+                    step={activeStep}
+                    player={onlineSelfPlayer}
+                    playerIndex={0}
+                    totalPlayers={onlineRoom.players.length}
+                    inputText={onlineInputText}
+                    isHiddenLocked={onlineHasSubmitted}
+                    submittedPlayerIds={onlineRoom.submittedPlayerIds}
+                    onlinePlayers={onlineRoom.players}
+                    isHost={isOnlineHost}
+                    onKickPlayer={mp.kickPlayer}
+                    onInputChange={setOnlineInputText}
+                    onConfirmTick={handleOnlineConfirm}
+                  />
+                )
+              ) : (
+                activeLocalPlayer && (
+                  <PlayScreen
+                    mode="LOCAL"
+                    step={activeStep}
+                    player={activeLocalPlayer}
+                    playerIndex={currentPlayerIndex}
+                    totalPlayers={players.length}
+                    inputText={inputText}
+                    isHiddenLocked={isHiddenLocked}
+                    onInputChange={setInputText}
+                    onConfirmTick={handleConfirmTick}
+                  />
+                )
+              ))}
 
-            {screen === 'SHUFFLING' && (
+            {effectiveScreen === 'SHUFFLING' && (
               <ShuffleScreen
                 finishedStepIndex={activeStep.index}
                 finishedStepTitle={activeStep.title}
               />
             )}
 
-            {screen === 'RESULTS' && (
+            {effectiveScreen === 'RESULTS' && (
               <ResultsScreen
-                results={results}
-                onReshuffle={handleReshuffle}
-                onPlayAgain={handlePlayAgain}
+                results={isOnline ? (onlineRoom?.results ?? []) : results}
+                isOnline={isOnline}
+                isHost={isOnline ? isOnlineHost : true}
+                onReshuffle={isOnline ? handleOnlineReshuffle : handleReshuffle}
+                onPlayAgain={isOnline ? handleOnlineReset : handlePlayAgain}
+                onLeaveRoom={isOnline ? mp.leaveRoom : undefined}
               />
             )}
           </section>
 
           <div className="hidden lg:block lg:col-span-5">
             <RoundSidebar
-              screen={screen}
-              players={players}
-              currentStepIndex={currentStepIndex}
+              mode={mode}
+              screen={effectiveScreen}
+              players={isOnline ? (onlineRoom?.players ?? []) : players}
+              currentStepIndex={effectiveStepIndex}
               currentPlayerIndex={currentPlayerIndex}
+              submittedPlayerIds={onlineRoom?.submittedPlayerIds}
+              myPlayerId={mp.myPlayerId}
+              hostId={onlineRoom?.hostId}
+              onKickPlayer={isOnline ? mp.kickPlayer : undefined}
             />
           </div>
         </div>
@@ -284,16 +538,16 @@ export default function App() {
 
             <ol className="mt-4 space-y-3 text-sm leading-relaxed text-[#64748B]">
               <li>
-                <span className="font-bold text-[#0F172A]">1. Oyuncuları Ekle:</span>{' '}
-                En az 2 kişi ekle ve oyunu başlat.
+                <span className="font-bold text-[#0F172A]">1. Modu Seç:</span>{' '}
+                Arkadaşlarınla uzaktan oynamak için <strong>Çevrimiçi Oda</strong> kurup kodu veya davet linkini paylaşabilir, ya da <strong>Tek Cihaz</strong> ile telefonu elden ele dolaştırabilirsin.
               </li>
               <li>
-                <span className="font-bold text-[#0F172A]">2. Gizlice Yaz ve Dolaştır:</span>{' '}
-                Sırayla Kim, Kiminle, Nerede ve Ne Yapıyor sorularını cevapla. Her onaydan sonra cevap gizlenir.
+                <span className="font-bold text-[#0F172A]">2. Gizlice Yaz:</span>{' '}
+                Sırayla Kim, Kiminle, Nerede ve Ne Yapıyor sorularını cevapla. Tüm cevaplar diğer oyunculardan gizli tutulur.
               </li>
               <li>
                 <span className="font-bold text-[#0F172A]">3. Karıştır ve Oku:</span>{' '}
-                Kimseye kendi yazdığı gelmeyecek şekilde tüm parçalar karışır ve komik cümleler ortaya çıkar.
+                Kimseye kendi yazdığı gelmeyecek şekilde tüm parçalar karışır ve ortaya çıkan komik cümleler herkesin ekranında görünür.
               </li>
             </ol>
 

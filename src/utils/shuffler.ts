@@ -1,4 +1,4 @@
-import { AnswersMap, Player, SentenceResult } from '../types/game';
+import type { AnswersMap, Player, SentenceResult } from '../types/game.ts';
 
 /**
  * Generates a derangement of items so no element remains at its original index

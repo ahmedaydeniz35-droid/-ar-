@@ -1,7 +1,6 @@
 import { FormEvent, useState } from 'react';
 import { Play, UserPlus, X } from 'lucide-react';
-import { Player } from '../types/game';
-import { FourColumnBar } from './FourColumnBar';
+import type { Player } from '../types/game.ts';
 
 interface LobbyScreenProps {
   players: Player[];
@@ -30,18 +29,7 @@ export function LobbyScreen({
   return (
     <div className="flex flex-col justify-between gap-6">
       <div>
-        <div className="mb-4">
-          <h1 className="font-display text-2xl sm:text-3xl font-extrabold tracking-tight text-[#0F172A] text-balance">
-            Kim, Kiminle, Nerede?
-          </h1>
-          <p className="mt-1.5 text-sm sm:text-base text-[#64748B]">
-            Kişileri ekle, telefonu sırayla dolaştır.
-          </p>
-        </div>
-
-        <FourColumnBar activeStepIndex={0} />
-
-        <form onSubmit={handleSubmit} className="mt-5 flex items-center gap-2.5">
+        <form onSubmit={handleSubmit} className="flex items-center gap-2.5">
           <label htmlFor="player-name-input" className="sr-only">
             Oyuncu adı
           </label>
