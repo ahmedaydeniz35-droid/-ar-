@@ -142,6 +142,24 @@ function detachSocketFromRoom(
   }
 }
 
+function notifyKickedSockets(roomCode: string, targetId: string) {
+  const set = roomSockets.get(roomCode);
+  if (!set) return;
+  for (const client of Array.from(set)) {
+    const clientSess = sessions.get(client);
+    if (clientSess?.playerId === targetId) {
+      set.delete(client);
+      sessions.set(client, { roomCode: null, playerId: null });
+      sendToSocket(client, { type: 'room:left' });
+      sendToSocket(client, {
+        type: 'room:error',
+        code: 'KICKED',
+        message: 'Oda yöneticisi tarafından odadan çıkarıldın.',
+      });
+    }
+  }
+}
+
 function handleClientMessage(ws: WebSocket, raw: string) {
   let msg: ClientMessage;
   try {
@@ -247,23 +265,7 @@ function handleClientMessage(ws: WebSocket, raw: string) {
           sess.playerId,
           targetId
         );
-
-        const set = roomSockets.get(sess.roomCode);
-        if (set) {
-          for (const client of Array.from(set)) {
-            const clientSess = sessions.get(client);
-            if (clientSess?.playerId === targetId) {
-              set.delete(client);
-              sessions.set(client, { roomCode: null, playerId: null });
-              sendToSocket(client, { type: 'room:left' });
-              sendToSocket(client, {
-                type: 'room:error',
-                code: 'KICKED',
-                message: 'Oda yöneticisi tarafından odadan çıkarıldın.',
-              });
-            }
-          }
-        }
+        notifyKickedSockets(sess.roomCode, targetId);
 
         if (!room) {
           clearShuffleTimer(sess.roomCode);
@@ -334,12 +336,228 @@ function handleClientMessage(ws: WebSocket, raw: string) {
   }
 }
 
+function sendHttpError(res: express.Response, err: unknown) {
+  if (err instanceof RoomError) {
+    const status =
+      err.code === 'ROOM_NOT_FOUND'
+        ? 404
+        : err.code === 'FORBIDDEN'
+          ? 403
+          : err.code === 'SESSION_EXPIRED'
+            ? 401
+            : 400;
+    return res.status(status).json({ code: err.code, message: err.message });
+  }
+  console.error('HTTP room API error:', err);
+  return res
+    .status(500)
+    .json({ code: 'INTERNAL_ERROR', message: 'Beklenmeyen bir hata oluştu.' });
+}
+
 async function startServer() {
   const app = express();
   const httpServer = http.createServer(app);
 
+  app.use('/api', (req, res, next) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    if (req.method === 'OPTIONS') {
+      res.status(204).end();
+      return;
+    }
+    next();
+  });
+
+  app.use('/api', express.json());
+
   app.get('/api/health', (_req, res) => {
     res.json({ ok: true, rooms: roomManager.getRoomCount() });
+  });
+
+  app.post('/api/rooms', (req, res) => {
+    try {
+      const playerName =
+        typeof req.body?.playerName === 'string' ? req.body.playerName : '';
+      const { room, player } = roomManager.createRoom(playerName);
+      res.json({
+        room: roomManager.toSnapshot(room),
+        playerId: player.id,
+        playerToken: player.token,
+      });
+    } catch (err) {
+      sendHttpError(res, err);
+    }
+  });
+
+  app.post('/api/rooms/join', (req, res) => {
+    try {
+      const roomCode =
+        typeof req.body?.roomCode === 'string' ? req.body.roomCode : '';
+      const playerName =
+        typeof req.body?.playerName === 'string' ? req.body.playerName : '';
+      const playerToken =
+        typeof req.body?.playerToken === 'string'
+          ? req.body.playerToken
+          : undefined;
+      const { room, player } = roomManager.joinRoom(
+        roomCode,
+        playerName,
+        playerToken
+      );
+      broadcastRoomState(room.code);
+      res.json({
+        room: roomManager.toSnapshot(room),
+        playerId: player.id,
+        playerToken: player.token,
+      });
+    } catch (err) {
+      sendHttpError(res, err);
+    }
+  });
+
+  app.post('/api/rooms/:code/reconnect', (req, res) => {
+    try {
+      const playerToken =
+        typeof req.body?.playerToken === 'string' ? req.body.playerToken : '';
+      const { room, player } = roomManager.reconnectRoom(
+        req.params.code,
+        playerToken
+      );
+      broadcastRoomState(room.code);
+      res.json({
+        room: roomManager.toSnapshot(room),
+        playerId: player.id,
+        playerToken: player.token,
+      });
+    } catch (err) {
+      sendHttpError(res, err);
+    }
+  });
+
+  app.get('/api/rooms/:code/state', (req, res) => {
+    try {
+      const token = typeof req.query.token === 'string' ? req.query.token : '';
+      const room = roomManager.getRoom(req.params.code);
+      if (!room) {
+        throw new RoomError('ROOM_NOT_FOUND', 'Oda artık mevcut değil.');
+      }
+      const player = room.players.find((p) => p.token === token);
+      if (!player) {
+        throw new RoomError('SESSION_EXPIRED', 'Oturumun sona ermiş.');
+      }
+      if (!player.connected) {
+        player.connected = true;
+        room.updatedAt = Date.now();
+        broadcastRoomState(room.code);
+      }
+      res.json({
+        room: roomManager.toSnapshot(room),
+        playerId: player.id,
+      });
+    } catch (err) {
+      sendHttpError(res, err);
+    }
+  });
+
+  app.post('/api/rooms/:code/action', (req, res) => {
+    try {
+      const token =
+        typeof req.body?.playerToken === 'string' ? req.body.playerToken : '';
+      const msg = req.body?.action as ClientMessage | undefined;
+      const room = roomManager.getRoom(req.params.code);
+      if (!room) {
+        throw new RoomError('ROOM_NOT_FOUND', 'Oda bulunamadı.');
+      }
+      const player = room.players.find((p) => p.token === token);
+      if (!player) {
+        throw new RoomError('SESSION_EXPIRED', 'Oturumun sona ermiş.');
+      }
+      if (!msg || typeof msg.type !== 'string') {
+        throw new RoomError('BAD_PAYLOAD', 'Geçersiz istek.');
+      }
+
+      switch (msg.type) {
+        case 'room:leave': {
+          const { room: updated, becameReadyToShuffle } = roomManager.leaveRoom(
+            room.code,
+            player.id
+          );
+          if (!updated) {
+            clearShuffleTimer(room.code);
+          } else {
+            if (updated.screen === 'LOBBY') clearShuffleTimer(updated.code);
+            if (becameReadyToShuffle) scheduleShuffleAdvance(updated.code);
+            broadcastRoomState(updated.code);
+          }
+          res.json({ left: true });
+          return;
+        }
+        case 'player:rename': {
+          const updated = roomManager.renamePlayer(
+            room.code,
+            player.id,
+            msg.name ?? ''
+          );
+          broadcastRoomState(updated.code);
+          res.json({ room: roomManager.toSnapshot(updated) });
+          return;
+        }
+        case 'player:kick': {
+          const targetId = msg.targetPlayerId;
+          const { room: updated, becameReadyToShuffle } =
+            roomManager.kickPlayer(room.code, player.id, targetId);
+          notifyKickedSockets(room.code, targetId);
+          if (!updated) {
+            clearShuffleTimer(room.code);
+            res.json({ room: null });
+            return;
+          }
+          if (updated.screen === 'LOBBY') clearShuffleTimer(updated.code);
+          if (becameReadyToShuffle) scheduleShuffleAdvance(updated.code);
+          broadcastRoomState(updated.code);
+          res.json({ room: roomManager.toSnapshot(updated) });
+          return;
+        }
+        case 'game:start': {
+          const updated = roomManager.startGame(room.code, player.id);
+          clearShuffleTimer(updated.code);
+          broadcastRoomState(updated.code);
+          res.json({ room: roomManager.toSnapshot(updated) });
+          return;
+        }
+        case 'answer:submit': {
+          const { room: updated, allSubmitted } = roomManager.submitAnswer(
+            room.code,
+            player.id,
+            msg.text ?? ''
+          );
+          broadcastRoomState(updated.code);
+          if (allSubmitted) {
+            scheduleShuffleAdvance(updated.code);
+          }
+          res.json({ room: roomManager.toSnapshot(updated) });
+          return;
+        }
+        case 'game:reshuffle': {
+          const updated = roomManager.reshuffleResults(room.code, player.id);
+          broadcastRoomState(updated.code);
+          res.json({ room: roomManager.toSnapshot(updated) });
+          return;
+        }
+        case 'game:reset': {
+          const updated = roomManager.resetToLobby(room.code, player.id);
+          clearShuffleTimer(updated.code);
+          broadcastRoomState(updated.code);
+          res.json({ room: roomManager.toSnapshot(updated) });
+          return;
+        }
+        default:
+          throw new RoomError('BAD_PAYLOAD', 'Desteklenmeyen işlem.');
+      }
+    } catch (err) {
+      sendHttpError(res, err);
+    }
   });
 
   const wss = new WebSocketServer({ server: httpServer, path: '/ws' });

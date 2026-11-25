@@ -11,6 +11,7 @@ import {
   X,
 } from 'lucide-react';
 import type { RoomSnapshot } from '../types/game.ts';
+import { getConfiguredServerUrl, saveCustomServerUrl } from '../hooks/useMultiplayerRoom.ts';
 import type { ConnectionStatus } from '../hooks/useMultiplayerRoom.ts';
 
 interface OnlineLobbyProps {
@@ -51,6 +52,10 @@ export function OnlineLobby({
   const [localError, setLocalError] = useState<string | null>(null);
   const [copiedType, setCopiedType] = useState<'code' | 'link' | null>(null);
   const [editingName, setEditingName] = useState('');
+  const [serverInputOpen, setServerInputOpen] = useState(false);
+  const [serverUrlDraft, setServerUrlDraft] = useState(() =>
+    getConfiguredServerUrl()
+  );
 
   const nameInputRef = useRef<HTMLInputElement>(null);
   const codeInputRef = useRef<HTMLInputElement>(null);
@@ -118,24 +123,67 @@ export function OnlineLobby({
       onJoinRoom(cleanCode, cleanName);
     };
 
+    const handleSaveServerUrl = (e: FormEvent) => {
+      e.preventDefault();
+      saveCustomServerUrl(serverUrlDraft);
+      setServerInputOpen(false);
+      onReconnect();
+    };
+
     return (
       <div className="space-y-4">
         {connectionFailed && connectionStatus !== 'connected' && (
           <div
             role="status"
-            className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm font-medium text-amber-900"
+            className="space-y-3 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm font-medium text-amber-900"
           >
-            <span>
-              Sunucuya bağlanılamadı. Tek cihaz modunu kullanabilir veya tekrar deneyebilirsin.
-            </span>
-            <button
-              type="button"
-              onClick={onReconnect}
-              className="flex h-9 items-center gap-1.5 rounded-xl bg-amber-900/10 px-3 text-xs font-bold text-amber-950 hover:bg-amber-900/15 whitespace-nowrap shrink-0"
-            >
-              <RefreshCw className="h-3.5 w-3.5" aria-hidden="true" />
-              <span>Tekrar Bağlan</span>
-            </button>
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <span>
+                Sunucuya bağlanılamadı. Tek cihaz modunu kullanabilir veya tekrar deneyebilirsin.
+              </span>
+              <div className="flex items-center gap-2 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => setServerInputOpen((prev) => !prev)}
+                  className="flex h-9 items-center rounded-xl border border-amber-300 bg-white/70 px-3 text-xs font-semibold text-amber-950 hover:bg-white whitespace-nowrap"
+                >
+                  Sunucu Adresi
+                </button>
+                <button
+                  type="button"
+                  onClick={onReconnect}
+                  className="flex h-9 items-center gap-1.5 rounded-xl bg-amber-900/10 px-3 text-xs font-bold text-amber-950 hover:bg-amber-900/15 whitespace-nowrap"
+                >
+                  <RefreshCw className="h-3.5 w-3.5" aria-hidden="true" />
+                  <span>Tekrar Bağlan</span>
+                </button>
+              </div>
+            </div>
+
+            {serverInputOpen && (
+              <form
+                onSubmit={handleSaveServerUrl}
+                className="flex items-center gap-2 border-t border-amber-200/80 pt-3"
+              >
+                <label htmlFor="custom-server-url" className="sr-only">
+                  Sunucu adresi
+                </label>
+                <input
+                  id="custom-server-url"
+                  type="url"
+                  value={serverUrlDraft}
+                  onChange={(e) => setServerUrlDraft(e.target.value)}
+                  placeholder="https://ornek-sunucu.com"
+                  className="h-10 min-w-0 flex-1 rounded-xl border border-amber-300 bg-white px-3 text-xs text-[#0F172A] placeholder:text-slate-400 focus:border-[#4338CA] focus:outline-none"
+                />
+                <button
+                  type="submit"
+                  className="flex h-10 shrink-0 items-center rounded-xl bg-[#4338CA] px-3.5 text-xs font-bold text-white hover:bg-[#3730A3]"
+                >
+                  Kaydet
+                </button>
+              </form>
+            )}
           </div>
         )}
 
