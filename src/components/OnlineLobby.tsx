@@ -6,23 +6,18 @@ import {
   LogOut,
   Play,
   PlusCircle,
-  RefreshCw,
   Users,
   X,
 } from 'lucide-react';
 import type { RoomSnapshot } from '../types/game.ts';
-import { getConfiguredServerUrl, saveCustomServerUrl } from '../hooks/useMultiplayerRoom.ts';
-import type { ConnectionStatus } from '../hooks/useMultiplayerRoom.ts';
 
 interface OnlineLobbyProps {
-  connectionStatus: ConnectionStatus;
-  connectionFailed: boolean;
   room: RoomSnapshot | null;
   myPlayerId: string | null;
   initialRoomCode?: string;
+  isBusy?: boolean;
   error: string | null;
   onClearError: () => void;
-  onReconnect: () => void;
   onCreateRoom: (playerName: string) => void;
   onJoinRoom: (roomCode: string, playerName: string) => void;
   onLeaveRoom: () => void;
@@ -32,14 +27,12 @@ interface OnlineLobbyProps {
 }
 
 export function OnlineLobby({
-  connectionStatus,
-  connectionFailed,
   room,
   myPlayerId,
   initialRoomCode = '',
+  isBusy = false,
   error,
   onClearError,
-  onReconnect,
   onCreateRoom,
   onJoinRoom,
   onLeaveRoom,
@@ -48,21 +41,19 @@ export function OnlineLobby({
   onStartGame,
 }: OnlineLobbyProps) {
   const [playerName, setPlayerName] = useState('');
-  const [joinCode, setJoinCode] = useState(initialRoomCode.toUpperCase());
+  const [joinCode, setJoinCode] = useState(
+    initialRoomCode.toUpperCase().slice(0, 6)
+  );
   const [localError, setLocalError] = useState<string | null>(null);
   const [copiedType, setCopiedType] = useState<'code' | 'link' | null>(null);
   const [editingName, setEditingName] = useState('');
-  const [serverInputOpen, setServerInputOpen] = useState(false);
-  const [serverUrlDraft, setServerUrlDraft] = useState(() =>
-    getConfiguredServerUrl()
-  );
 
   const nameInputRef = useRef<HTMLInputElement>(null);
   const codeInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     if (initialRoomCode && !joinCode) {
-      setJoinCode(initialRoomCode.toUpperCase());
+      setJoinCode(initialRoomCode.toUpperCase().slice(0, 6));
     }
   }, [initialRoomCode, joinCode]);
 
@@ -98,6 +89,7 @@ export function OnlineLobby({
 
     const handleCreate = (e: FormEvent) => {
       e.preventDefault();
+      if (isBusy) return;
       if (!cleanName) {
         setLocalError('Lütfen önce oyuncu adını yaz.');
         nameInputRef.current?.focus();
@@ -109,13 +101,14 @@ export function OnlineLobby({
 
     const handleJoin = (e: FormEvent) => {
       e.preventDefault();
+      if (isBusy) return;
       if (!cleanName) {
         setLocalError('Katılmak için önce oyuncu adını yaz.');
         nameInputRef.current?.focus();
         return;
       }
-      if (cleanCode.length < 4) {
-        setLocalError('Lütfen en az 4 karakterli oda kodunu yaz.');
+      if (cleanCode.length !== 6) {
+        setLocalError('Lütfen 6 karakterli oda kodunu yaz.');
         codeInputRef.current?.focus();
         return;
       }
@@ -123,70 +116,8 @@ export function OnlineLobby({
       onJoinRoom(cleanCode, cleanName);
     };
 
-    const handleSaveServerUrl = (e: FormEvent) => {
-      e.preventDefault();
-      saveCustomServerUrl(serverUrlDraft);
-      setServerInputOpen(false);
-      onReconnect();
-    };
-
     return (
       <div className="space-y-4">
-        {connectionFailed && connectionStatus !== 'connected' && (
-          <div
-            role="status"
-            className="space-y-3 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm font-medium text-amber-900"
-          >
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              <span>
-                Sunucuya bağlanılamadı. Tek cihaz modunu kullanabilir veya tekrar deneyebilirsin.
-              </span>
-              <div className="flex items-center gap-2 shrink-0">
-                <button
-                  type="button"
-                  onClick={() => setServerInputOpen((prev) => !prev)}
-                  className="flex h-9 items-center rounded-xl border border-amber-300 bg-white/70 px-3 text-xs font-semibold text-amber-950 hover:bg-white whitespace-nowrap"
-                >
-                  Sunucu Adresi
-                </button>
-                <button
-                  type="button"
-                  onClick={onReconnect}
-                  className="flex h-9 items-center gap-1.5 rounded-xl bg-amber-900/10 px-3 text-xs font-bold text-amber-950 hover:bg-amber-900/15 whitespace-nowrap"
-                >
-                  <RefreshCw className="h-3.5 w-3.5" aria-hidden="true" />
-                  <span>Tekrar Bağlan</span>
-                </button>
-              </div>
-            </div>
-
-            {serverInputOpen && (
-              <form
-                onSubmit={handleSaveServerUrl}
-                className="flex items-center gap-2 border-t border-amber-200/80 pt-3"
-              >
-                <label htmlFor="custom-server-url" className="sr-only">
-                  Sunucu adresi
-                </label>
-                <input
-                  id="custom-server-url"
-                  type="url"
-                  value={serverUrlDraft}
-                  onChange={(e) => setServerUrlDraft(e.target.value)}
-                  placeholder="https://ornek-sunucu.com"
-                  className="h-10 min-w-0 flex-1 rounded-xl border border-amber-300 bg-white px-3 text-xs text-[#0F172A] placeholder:text-slate-400 focus:border-[#4338CA] focus:outline-none"
-                />
-                <button
-                  type="submit"
-                  className="flex h-10 shrink-0 items-center rounded-xl bg-[#4338CA] px-3.5 text-xs font-bold text-white hover:bg-[#3730A3]"
-                >
-                  Kaydet
-                </button>
-              </form>
-            )}
-          </div>
-        )}
-
         {activeError && (
           <div
             role="alert"
@@ -228,7 +159,8 @@ export function OnlineLobby({
           <form onSubmit={handleCreate} className="mt-4">
             <button
               type="submit"
-              className="flex h-13 w-full cursor-pointer items-center justify-center gap-2 rounded-2xl bg-[#4338CA] px-5 text-base font-bold text-white transition-all duration-150 hover:bg-[#3730A3] active:scale-[0.99] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#4338CA] focus-visible:ring-offset-2 whitespace-nowrap shrink-0"
+              disabled={isBusy}
+              className="flex h-13 w-full cursor-pointer items-center justify-center gap-2 rounded-2xl bg-[#4338CA] px-5 text-base font-bold text-white transition-all duration-150 hover:bg-[#3730A3] active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#4338CA] focus-visible:ring-offset-2 whitespace-nowrap shrink-0"
             >
               <PlusCircle className="h-5 w-5" aria-hidden="true" />
               <span>Yeni Oda Kur</span>
@@ -253,16 +185,22 @@ export function OnlineLobby({
               type="text"
               value={joinCode}
               onChange={(e) => {
-                setJoinCode(e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, ''));
+                setJoinCode(
+                  e.target.value
+                    .toUpperCase()
+                    .replace(/[^A-Z0-9]/g, '')
+                    .slice(0, 6)
+                );
                 if (activeError) dismissError();
               }}
               placeholder="ODA KODU"
-              maxLength={8}
+              maxLength={6}
               className="h-13 min-w-0 flex-1 rounded-2xl border border-slate-200 bg-[#F6F7FB]/50 px-4 font-mono text-base font-bold uppercase tracking-widest text-[#0F172A] placeholder:font-sans placeholder:font-normal placeholder:tracking-normal placeholder:text-[#64748B] focus:border-[#4338CA] focus:bg-white focus:outline-none focus-visible:ring-2 focus-visible:ring-[#4338CA]/30 transition-colors"
             />
             <button
               type="submit"
-              className="flex h-13 shrink-0 cursor-pointer items-center justify-center rounded-2xl bg-[#0F172A] px-6 text-base font-bold text-white transition-all duration-150 hover:bg-slate-800 active:scale-[0.98] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#0F172A] focus-visible:ring-offset-2 whitespace-nowrap"
+              disabled={isBusy}
+              className="flex h-13 shrink-0 cursor-pointer items-center justify-center rounded-2xl bg-[#0F172A] px-6 text-base font-bold text-white transition-all duration-150 hover:bg-slate-800 active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#0F172A] focus-visible:ring-offset-2 whitespace-nowrap"
             >
               Katıl
             </button>
@@ -422,18 +360,10 @@ export function OnlineLobby({
                     {[
                       isSelf ? 'Sen' : null,
                       player.isHost ? 'Yönetici' : null,
-                      !player.connected ? 'Çevrimdışı' : null,
                     ]
                       .filter(Boolean)
                       .join(' · ') || 'Hazır'}
                   </span>
-
-                  <span
-                    aria-hidden="true"
-                    className={`h-2.5 w-2.5 rounded-full ${
-                      player.connected ? 'bg-[#16A34A]' : 'bg-slate-300'
-                    }`}
-                  />
 
                   {isHost && !isSelf && (
                     <button

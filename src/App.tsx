@@ -278,15 +278,7 @@ export default function App() {
             </button>
 
             {isOnline && onlineRoom && (
-              <span className="hidden sm:inline-flex items-center gap-1.5 rounded-lg bg-[#EEF2FF] px-2.5 py-1 font-mono text-xs font-bold text-[#4338CA] whitespace-nowrap shrink-0">
-                <span
-                  aria-hidden="true"
-                  className={`h-2 w-2 rounded-full ${
-                    mp.connectionStatus === 'connected'
-                      ? 'bg-[#16A34A]'
-                      : 'bg-amber-500'
-                  }`}
-                />
+              <span className="hidden sm:inline-flex items-center rounded-lg bg-[#EEF2FF] px-2.5 py-1 font-mono text-xs font-bold text-[#4338CA] whitespace-nowrap shrink-0">
                 Oda: {onlineRoom.code}
               </span>
             )}
@@ -411,14 +403,12 @@ export default function App() {
 
                 {isOnline ? (
                   <OnlineLobby
-                    connectionStatus={mp.connectionStatus}
-                    connectionFailed={mp.connectionFailed}
                     room={onlineRoom}
                     myPlayerId={mp.myPlayerId}
                     initialRoomCode={initialQuery.roomCode}
+                    isBusy={mp.isBusy}
                     error={mp.error}
                     onClearError={mp.clearError}
-                    onReconnect={mp.reconnectNow}
                     onCreateRoom={mp.createRoom}
                     onJoinRoom={mp.joinRoom}
                     onLeaveRoom={mp.leaveRoom}

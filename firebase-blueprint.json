@@ -1,0 +1,174 @@
+{
+  "entities": {
+    "Room": {
+      "title": "Room",
+      "description": "Online multiplayer game room state synchronized across players.",
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string",
+          "description": "6-character uppercase alphanumeric room code matching the document ID.",
+          "minLength": 6,
+          "maxLength": 6,
+          "pattern": "^[A-Z0-9]{6}$"
+        },
+        "hostId": {
+          "type": "string",
+          "description": "Active host player ID.",
+          "minLength": 8,
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "screen": {
+          "type": "string",
+          "description": "Current game screen phase.",
+          "enum": ["LOBBY", "PLAYING", "SHUFFLING", "RESULTS"]
+        },
+        "currentStepIndex": {
+          "type": "integer",
+          "description": "Active prompt index (0=KIM, 1=KIMINLE, 2=NEREDE, 3=NE_YAPIYOR)."
+        },
+        "playerOrder": {
+          "type": "array",
+          "description": "Ordered list of player IDs currently in the room (max 16)."
+        },
+        "results": {
+          "type": "array",
+          "description": "Generated shuffled sentence results once the round finishes (max 16)."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server last-update timestamp."
+        }
+      },
+      "required": [
+        "code",
+        "hostId",
+        "screen",
+        "currentStepIndex",
+        "playerOrder",
+        "results",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "RoomPlayer": {
+      "title": "RoomPlayer",
+      "description": "Participant inside an online multiplayer room.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Player unique identifier matching the document ID.",
+          "minLength": 8,
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "roomCode": {
+          "type": "string",
+          "description": "6-character parent room code for query isolation.",
+          "minLength": 6,
+          "maxLength": 6,
+          "pattern": "^[A-Z0-9]{6}$"
+        },
+        "name": {
+          "type": "string",
+          "description": "Display name chosen by the player.",
+          "minLength": 1,
+          "maxLength": 32
+        },
+        "isHost": {
+          "type": "boolean",
+          "description": "Whether this player is currently the room host."
+        },
+        "submittedStepIndex": {
+          "type": "integer",
+          "description": "Highest step index submitted in the current round (-1 when none)."
+        },
+        "joinedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the player joined."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when player metadata changed."
+        }
+      },
+      "required": [
+        "id",
+        "roomCode",
+        "name",
+        "isHost",
+        "submittedStepIndex",
+        "joinedAt",
+        "updatedAt"
+      ]
+    },
+    "RoomAnswer": {
+      "title": "RoomAnswer",
+      "description": "Secret player answer for one prompt step, isolated from player status docs until shuffle/results.",
+      "type": "object",
+      "properties": {
+        "roomCode": {
+          "type": "string",
+          "description": "6-character parent room code for query isolation.",
+          "minLength": 6,
+          "maxLength": 6,
+          "pattern": "^[A-Z0-9]{6}$"
+        },
+        "stepKey": {
+          "type": "string",
+          "description": "Prompt step identifier.",
+          "enum": ["KIM", "KIMINLE", "NEREDE", "NE_YAPIYOR"]
+        },
+        "playerId": {
+          "type": "string",
+          "description": "Authoring player ID.",
+          "minLength": 8,
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "text": {
+          "type": "string",
+          "description": "Secret answer text written by the player.",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server submission timestamp."
+        }
+      },
+      "required": ["roomCode", "stepKey", "playerId", "text", "updatedAt"]
+    }
+  },
+  "firestore": {
+    "/rooms/{roomCode}": {
+      "schema": {
+        "$ref": "#/entities/Room"
+      },
+      "description": "Game room state, turn step, bounded player order, and final shuffled sentences."
+    },
+    "/rooms/{roomCode}/players/{playerId}": {
+      "schema": {
+        "$ref": "#/entities/RoomPlayer"
+      },
+      "description": "Players belonging to a room and whether they have locked in the active step."
+    },
+    "/rooms/{roomCode}/answers/{answerId}": {
+      "schema": {
+        "$ref": "#/entities/RoomAnswer"
+      },
+      "description": "Secret answers per step and player, read only after round completion/shuffling."
+    }
+  }
+}

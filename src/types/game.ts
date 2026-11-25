@@ -74,27 +74,3 @@ export interface RoomSnapshot {
   results: SentenceResult[];
 }
 
-export type ClientMessage =
-  | { type: 'room:create'; playerName: string }
-  | { type: 'room:join'; roomCode: string; playerName: string; playerToken?: string }
-  | { type: 'room:reconnect'; roomCode: string; playerToken: string }
-  | { type: 'room:leave' }
-  | { type: 'player:rename'; name: string }
-  | { type: 'player:kick'; targetPlayerId: string }
-  | { type: 'game:start' }
-  | { type: 'answer:submit'; text: string }
-  | { type: 'game:reshuffle' }
-  | { type: 'game:reset' }
-  | { type: 'ping' };
-
-export type ServerMessage =
-  | {
-      type: 'room:joined';
-      room: RoomSnapshot;
-      playerId: string;
-      playerToken: string;
-    }
-  | { type: 'room:state'; room: RoomSnapshot }
-  | { type: 'room:left' }
-  | { type: 'room:error'; code: string; message: string }
-  | { type: 'pong' };

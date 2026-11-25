@@ -163,20 +163,8 @@ export function RoundSidebar({
                         )}
                       </span>
                     ) : roomPlayer ? (
-                      <span className="flex items-center gap-1.5 text-xs text-[#64748B] whitespace-nowrap">
-                        <span
-                          aria-hidden="true"
-                          className={`h-2 w-2 rounded-full ${
-                            roomPlayer.connected ? 'bg-[#16A34A]' : 'bg-slate-300'
-                          }`}
-                        />
-                        <span>
-                          {roomPlayer.isHost
-                            ? 'Yönetici'
-                            : roomPlayer.connected
-                              ? 'Çevrimiçi'
-                              : 'Çevrimdışı'}
-                        </span>
+                      <span className="text-xs text-[#64748B] whitespace-nowrap">
+                        {roomPlayer.isHost ? 'Yönetici' : 'Hazır'}
                       </span>
                     ) : null}
 

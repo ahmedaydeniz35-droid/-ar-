@@ -1,0 +1,297 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global default-deny safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Connection health check path used at startup
+    match /test/{docId} {
+      allow get: if docId == 'connection';
+      allow list, write: if false;
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidId(id) {
+      return id is string &&
+        id.size() >= 8 &&
+        id.size() <= 64 &&
+        id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidAnswerDocId(id) {
+      return id is string &&
+        id.size() >= 12 &&
+        id.size() <= 80 &&
+        id.matches('^(KIM|KIMINLE|NEREDE|NE_YAPIYOR)_[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidRoomCode(code) {
+      return code is string &&
+        code.size() == 6 &&
+        code.matches('^[A-Z0-9]{6}$');
+    }
+
+    function roomExists(roomCode) {
+      return exists(/databases/$(database)/documents/rooms/$(roomCode));
+    }
+
+    function getRoom(roomCode) {
+      return get(/databases/$(database)/documents/rooms/$(roomCode));
+    }
+
+    function isValidScreen(screen) {
+      return screen is string &&
+        screen in ['LOBBY', 'PLAYING', 'SHUFFLING', 'RESULTS'];
+    }
+
+    function isValidStepKey(stepKey) {
+      return stepKey is string &&
+        stepKey in ['KIM', 'KIMINLE', 'NEREDE', 'NE_YAPIYOR'];
+    }
+
+    function isValidRoom(data, roomCode) {
+      return data.keys().hasAll([
+          'code',
+          'hostId',
+          'screen',
+          'currentStepIndex',
+          'playerOrder',
+          'results',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'code',
+          'hostId',
+          'screen',
+          'currentStepIndex',
+          'playerOrder',
+          'results',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        isValidRoomCode(data.code) &&
+        data.code == roomCode &&
+        isValidId(data.hostId) &&
+        isValidScreen(data.screen) &&
+        data.currentStepIndex is int &&
+        data.currentStepIndex >= 0 &&
+        data.currentStepIndex <= 3 &&
+        data.playerOrder is list &&
+        data.playerOrder.size() >= 1 &&
+        data.playerOrder.size() <= 16 &&
+        data.playerOrder[0] is string &&
+        isValidId(data.playerOrder[0]) &&
+        data.results is list &&
+        data.results.size() <= 16 &&
+        (data.results.size() == 0 || data.results[0] is map) &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidRoomPlayer(data, playerId, roomCode) {
+      return data.keys().hasAll([
+          'id',
+          'roomCode',
+          'name',
+          'isHost',
+          'submittedStepIndex',
+          'joinedAt',
+          'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'id',
+          'roomCode',
+          'name',
+          'isHost',
+          'submittedStepIndex',
+          'joinedAt',
+          'updatedAt'
+        ]) &&
+        isValidId(data.id) &&
+        data.id == playerId &&
+        isValidRoomCode(data.roomCode) &&
+        data.roomCode == roomCode &&
+        data.name is string &&
+        data.name.size() >= 1 &&
+        data.name.size() <= 32 &&
+        data.isHost is bool &&
+        data.submittedStepIndex is int &&
+        data.submittedStepIndex >= -1 &&
+        data.submittedStepIndex <= 3 &&
+        data.joinedAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidRoomAnswer(data, answerId, roomCode) {
+      return data.keys().hasAll(['roomCode', 'stepKey', 'playerId', 'text', 'updatedAt']) &&
+        data.keys().hasOnly(['roomCode', 'stepKey', 'playerId', 'text', 'updatedAt']) &&
+        isValidRoomCode(data.roomCode) &&
+        data.roomCode == roomCode &&
+        isValidStepKey(data.stepKey) &&
+        isValidId(data.playerId) &&
+        answerId == data.stepKey + '_' + data.playerId &&
+        data.text is string &&
+        data.text.size() >= 1 &&
+        data.text.size() <= 160 &&
+        data.updatedAt is timestamp;
+    }
+
+    match /rooms/{roomCode} {
+      // Must know the exact 6-character code; room scraping via list is forbidden.
+      allow get: if isValidRoomCode(roomCode);
+      allow list: if false;
+
+      allow create: if isValidRoomCode(roomCode) &&
+        isValidRoom(incoming(), roomCode) &&
+        incoming().screen == 'LOBBY' &&
+        incoming().currentStepIndex == 0 &&
+        incoming().playerOrder.size() == 1 &&
+        incoming().playerOrder[0] == incoming().hostId &&
+        incoming().results.size() == 0 &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+
+      allow update: if isValidRoomCode(roomCode) &&
+        isValidRoom(incoming(), roomCode) &&
+        incoming().code == existing().code &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time && (
+          // Action: Player joins in lobby or leaves/is removed (with optional host transfer)
+          (
+            (existing().screen == 'LOBBY' || incoming().playerOrder.size() <= existing().playerOrder.size()) &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['playerOrder', 'hostId', 'updatedAt'])
+          ) ||
+          // Action: Host starts game from LOBBY -> PLAYING (min 2 players)
+          (
+            existing().screen == 'LOBBY' &&
+            existing().playerOrder.size() >= 2 &&
+            incoming().screen == 'PLAYING' &&
+            incoming().currentStepIndex == 0 &&
+            incoming().results.size() == 0 &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['screen', 'currentStepIndex', 'results', 'updatedAt'])
+          ) ||
+          // Action: All active players submitted current step (PLAYING -> SHUFFLING)
+          (
+            existing().screen == 'PLAYING' &&
+            incoming().screen == 'SHUFFLING' &&
+            incoming().currentStepIndex == existing().currentStepIndex &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['screen', 'updatedAt'])
+          ) ||
+          // Action: Advance from SHUFFLING to next step (PLAYING)
+          (
+            existing().screen == 'SHUFFLING' &&
+            existing().currentStepIndex < 3 &&
+            incoming().screen == 'PLAYING' &&
+            incoming().currentStepIndex == existing().currentStepIndex + 1 &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['screen', 'currentStepIndex', 'updatedAt'])
+          ) ||
+          // Action: Reveal final shuffled sentences (SHUFFLING step 3 -> RESULTS)
+          (
+            existing().screen == 'SHUFFLING' &&
+            existing().currentStepIndex == 3 &&
+            incoming().screen == 'RESULTS' &&
+            incoming().results.size() >= 2 &&
+            incoming().results.size() <= 16 &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['screen', 'results', 'updatedAt'])
+          ) ||
+          // Action: Reshuffle existing round answers in RESULTS
+          (
+            existing().screen == 'RESULTS' &&
+            incoming().screen == 'RESULTS' &&
+            incoming().results.size() >= 2 &&
+            incoming().results.size() <= 16 &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['results', 'updatedAt'])
+          ) ||
+          // Action: Reset room back to LOBBY for a new round
+          (
+            incoming().screen == 'LOBBY' &&
+            incoming().currentStepIndex == 0 &&
+            incoming().results.size() == 0 &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['screen', 'currentStepIndex', 'results', 'updatedAt'])
+          )
+        );
+
+      allow delete: if isValidRoomCode(roomCode) &&
+        existing().playerOrder.size() <= 1;
+
+      match /players/{playerId} {
+        allow get: if isValidRoomCode(roomCode) &&
+          isValidId(playerId) &&
+          roomExists(roomCode);
+
+        allow list: if isValidRoomCode(roomCode) &&
+          resource.data.roomCode == roomCode;
+
+        allow create: if isValidRoomCode(roomCode) &&
+          isValidId(playerId) &&
+          isValidRoomPlayer(incoming(), playerId, roomCode) &&
+          incoming().joinedAt == request.time &&
+          incoming().updatedAt == request.time &&
+          existsAfter(/databases/$(database)/documents/rooms/$(roomCode)) &&
+          getAfter(/databases/$(database)/documents/rooms/$(roomCode)).data.screen == 'LOBBY';
+
+        allow update: if isValidRoomCode(roomCode) &&
+          isValidId(playerId) &&
+          isValidRoomPlayer(incoming(), playerId, roomCode) &&
+          roomExists(roomCode) &&
+          incoming().id == existing().id &&
+          incoming().roomCode == existing().roomCode &&
+          incoming().joinedAt == existing().joinedAt &&
+          incoming().updatedAt == request.time && (
+            // Action: Player updates own display name
+            incoming().diff(existing()).affectedKeys().hasOnly(['name', 'updatedAt']) ||
+            // Action: Player submits current step or resets submittedStepIndex for new round
+            incoming().diff(existing()).affectedKeys().hasOnly(['submittedStepIndex', 'updatedAt']) ||
+            // Action: Host role transferred when previous host leaves
+            incoming().diff(existing()).affectedKeys().hasOnly(['isHost', 'updatedAt'])
+          );
+
+        allow delete: if isValidRoomCode(roomCode) &&
+          isValidId(playerId) &&
+          roomExists(roomCode);
+      }
+
+      match /answers/{answerId} {
+        allow get: if isValidRoomCode(roomCode) &&
+          isValidAnswerDocId(answerId) &&
+          roomExists(roomCode) &&
+          getRoom(roomCode).data.screen != 'LOBBY';
+
+        allow list: if isValidRoomCode(roomCode) &&
+          resource.data.roomCode == roomCode;
+
+        allow create: if isValidRoomCode(roomCode) &&
+          isValidAnswerDocId(answerId) &&
+          isValidRoomAnswer(incoming(), answerId, roomCode) &&
+          roomExists(roomCode) &&
+          getRoom(roomCode).data.screen == 'PLAYING' &&
+          incoming().updatedAt == request.time;
+
+        allow update: if isValidRoomCode(roomCode) &&
+          isValidAnswerDocId(answerId) &&
+          isValidRoomAnswer(incoming(), answerId, roomCode) &&
+          roomExists(roomCode) &&
+          getRoom(roomCode).data.screen == 'PLAYING' &&
+          incoming().roomCode == existing().roomCode &&
+          incoming().stepKey == existing().stepKey &&
+          incoming().playerId == existing().playerId &&
+          incoming().updatedAt == request.time &&
+          incoming().diff(existing()).affectedKeys().hasOnly(['text', 'updatedAt']);
+
+        allow delete: if isValidRoomCode(roomCode) &&
+          isValidAnswerDocId(answerId) &&
+          roomExists(roomCode);
+      }
+    }
+  }
+}

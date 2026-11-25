@@ -1,26 +1,68 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
-import type { ClientMessage, RoomSnapshot, ServerMessage } from '../types/game.ts';
-
-export type ConnectionStatus = 'connecting' | 'connected' | 'disconnected';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  collection,
+  doc,
+  getDoc,
+  getDocs,
+  onSnapshot,
+  query,
+  runTransaction,
+  serverTimestamp,
+  where,
+  writeBatch,
+} from 'firebase/firestore';
+import { db, handleFirestoreError, OperationType } from '../firebase.ts';
+import { GAME_STEPS } from '../types/game.ts';
+import type { RoomSnapshot } from '../types/game.ts';
+import { buildSentences } from '../utils/shuffler.ts';
+import {
+  areAllPlayersSubmitted,
+  buildAnswersMapFromDocs,
+  computeSubmittedPlayerIds,
+  createRoomPlayerId,
+  generateRoomCode,
+  isPermissionDeniedError,
+  isValidRoomCode,
+  MAX_ROOM_PLAYERS,
+  normalizeRoomCode,
+  orderRoomPlayers,
+  sanitizeAnswerText,
+  sanitizePlayerName,
+} from '../utils/roomHelpers.ts';
+import type {
+  FirestoreAnswerDoc,
+  FirestorePlayerDoc,
+  FirestoreRoomDoc,
+} from '../utils/roomHelpers.ts';
 
 interface StoredSession {
   roomCode: string;
-  playerToken: string;
+  playerId: string;
   playerName: string;
 }
 
+class RoomDomainError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'RoomDomainError';
+  }
+}
+
 const SESSION_STORAGE_KEY = 'kkn_multiplayer_session';
-const CUSTOM_SERVER_STORAGE_KEY = 'kkn_server_url';
 
 function readStoredSession(): StoredSession | null {
   try {
     const raw = sessionStorage.getItem(SESSION_STORAGE_KEY);
     if (!raw) return null;
     const parsed = JSON.parse(raw) as Partial<StoredSession>;
-    if (parsed.roomCode && parsed.playerToken) {
+    if (
+      parsed.roomCode &&
+      isValidRoomCode(parsed.roomCode) &&
+      parsed.playerId
+    ) {
       return {
         roomCode: parsed.roomCode,
-        playerToken: parsed.playerToken,
+        playerId: parsed.playerId,
         playerName: parsed.playerName ?? '',
       };
     }
@@ -42,54 +84,6 @@ function writeStoredSession(session: StoredSession | null) {
   }
 }
 
-function isValidServerUrl(value: string | undefined): value is string {
-  if (!value) return false;
-  return /^https?:\/\/[a-zA-Z0-9.-]+(:\d+)?(\/.*)?$/.test(value.trim());
-}
-
-export function getConfiguredServerUrl(): string {
-  const envUrl = import.meta.env.VITE_SERVER_URL as string | undefined;
-  if (isValidServerUrl(envUrl)) {
-    return envUrl.trim().replace(/\/+$/, '');
-  }
-  try {
-    const saved = localStorage.getItem(CUSTOM_SERVER_STORAGE_KEY);
-    if (saved && isValidServerUrl(saved)) {
-      return saved.trim().replace(/\/+$/, '');
-    }
-  } catch {
-    // Ignore storage errors
-  }
-  return '';
-}
-
-export function saveCustomServerUrl(url: string) {
-  try {
-    const clean = url.trim().replace(/\/+$/, '');
-    if (!clean || !isValidServerUrl(clean)) {
-      localStorage.removeItem(CUSTOM_SERVER_STORAGE_KEY);
-    } else {
-      localStorage.setItem(CUSTOM_SERVER_STORAGE_KEY, clean);
-    }
-  } catch {
-    // Ignore storage errors
-  }
-}
-
-function resolveApiBase(): string {
-  return getConfiguredServerUrl();
-}
-
-function resolveWebSocketUrl(): string {
-  const base = getConfiguredServerUrl();
-  if (base) {
-    if (base.startsWith('https://')) return `${base.replace('https://', 'wss://')}/ws`;
-    if (base.startsWith('http://')) return `${base.replace('http://', 'ws://')}/ws`;
-  }
-  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  return `${protocol}//${window.location.host}/ws`;
-}
-
 function updateUrlRoomParam(roomCode: string | null) {
   try {
     const url = new URL(window.location.href);
@@ -104,554 +98,850 @@ function updateUrlRoomParam(roomCode: string | null) {
   }
 }
 
-async function postJson<T>(url: string, body: unknown): Promise<T> {
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  const text = await res.text();
-  let data: unknown = null;
-  try {
-    data = text ? JSON.parse(text) : null;
-  } catch {
-    throw new Error('Sunucudan geçersiz yanıt alındı.');
-  }
-  if (!res.ok) {
-    const errMsg =
-      data &&
-      typeof data === 'object' &&
-      'message' in data &&
-      typeof (data as { message: unknown }).message === 'string'
-        ? (data as { message: string }).message
-        : 'İşlem başarısız oldu.';
-    const errCode =
-      data &&
-      typeof data === 'object' &&
-      'code' in data &&
-      typeof (data as { code: unknown }).code === 'string'
-        ? (data as { code: string }).code
-        : 'HTTP_ERROR';
-    const err = new Error(errMsg) as Error & { code?: string };
-    err.code = errCode;
-    throw err;
-  }
-  return data as T;
-}
-
 export function useMultiplayerRoom(enabled: boolean) {
-  const [connectionStatus, setConnectionStatus] =
-    useState<ConnectionStatus>('connecting');
-  const [connectionFailed, setConnectionFailed] = useState(false);
-  const [room, setRoom] = useState<RoomSnapshot | null>(null);
-  const [myPlayerId, setMyPlayerId] = useState<string | null>(null);
+  const [activeSession, setActiveSession] = useState<{
+    roomCode: string;
+    playerId: string;
+  } | null>(null);
+  const [roomDoc, setRoomDoc] = useState<FirestoreRoomDoc | null>(null);
+  const [playerDocs, setPlayerDocs] = useState<FirestorePlayerDoc[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [isBusy, setIsBusy] = useState(false);
+  const [fatalError, setFatalError] = useState<Error | null>(null);
 
-  const wsRef = useRef<WebSocket | null>(null);
-  const reconnectTimerRef = useRef<number | null>(null);
-  const reconnectAttemptRef = useRef(0);
+  if (fatalError) {
+    throw fatalError;
+  }
+
   const unmountedRef = useRef(false);
-  const playerNameRef = useRef('');
-  const playerTokenRef = useRef<string | null>(null);
-  const roomCodeRef = useRef<string | null>(null);
-  const httpReachableRef = useRef(false);
-  const connectFnRef = useRef<(() => void) | null>(null);
+  const hasLoadedRoomRef = useRef(false);
+  const restoringRef = useRef(false);
 
-  const applyJoinedRoom = useCallback(
-    (joinedRoom: RoomSnapshot, playerId: string, playerToken: string) => {
+  const applySession = useCallback(
+    (roomCode: string, playerId: string, playerName: string) => {
+      hasLoadedRoomRef.current = false;
       setError(null);
-      setConnectionFailed(false);
-      setConnectionStatus('connected');
-      setRoom(joinedRoom);
-      setMyPlayerId(playerId);
-      roomCodeRef.current = joinedRoom.code;
-      playerTokenRef.current = playerToken;
-      writeStoredSession({
-        roomCode: joinedRoom.code,
-        playerToken,
-        playerName: playerNameRef.current,
-      });
-      updateUrlRoomParam(joinedRoom.code);
+      setRoomDoc(null);
+      setPlayerDocs([]);
+      setActiveSession({ roomCode, playerId });
+      writeStoredSession({ roomCode, playerId, playerName });
+      updateUrlRoomParam(roomCode);
     },
     []
   );
 
   const clearRoomSession = useCallback(() => {
-    setRoom(null);
-    setMyPlayerId(null);
-    roomCodeRef.current = null;
-    playerTokenRef.current = null;
+    hasLoadedRoomRef.current = false;
+    setActiveSession(null);
+    setRoomDoc(null);
+    setPlayerDocs([]);
     writeStoredSession(null);
     updateUrlRoomParam(null);
   }, []);
 
-  const probeHealth = useCallback(async (): Promise<boolean> => {
-    try {
-      const res = await fetch(`${resolveApiBase()}/api/health`);
-      if (!res.ok) return false;
-      const data = (await res.json()) as { ok?: boolean };
-      if (data?.ok) {
-        httpReachableRef.current = true;
-        setConnectionFailed(false);
-        setConnectionStatus('connected');
-        return true;
+  const reportError = useCallback(
+    (err: unknown, op: OperationType, path: string, fallbackMessage: string) => {
+      if (err instanceof RoomDomainError) {
+        setError(err.message);
+        return;
       }
-    } catch {
-      // Unreachable
-    }
-    httpReachableRef.current = false;
-    return false;
-  }, []);
+      if (isPermissionDeniedError(err)) {
+        try {
+          handleFirestoreError(err, op, path);
+        } catch (wrapped) {
+          setFatalError(
+            wrapped instanceof Error ? wrapped : new Error(String(wrapped))
+          );
+        }
+        return;
+      }
+      try {
+        handleFirestoreError(err, op, path);
+      } catch {
+        // Logged via handleFirestoreError; surface friendly message to player
+      }
+      setError(fallbackMessage);
+    },
+    []
+  );
 
+  // Restore stored session on mount when ONLINE mode is active
   useEffect(() => {
     unmountedRef.current = false;
-    if (!enabled) {
+    if (!enabled || activeSession || restoringRef.current) {
       return;
     }
 
-    let pingInterval: number | null = null;
-    let pollInterval: number | null = null;
+    const stored = readStoredSession();
+    const urlRoom = normalizeRoomCode(
+      new URLSearchParams(window.location.search).get('room') ?? ''
+    );
+    if (!stored || (urlRoom && urlRoom !== stored.roomCode)) {
+      return;
+    }
 
-    const tryHttpReconnect = async () => {
-      const stored = readStoredSession();
-      const urlRoom = new URLSearchParams(window.location.search)
-        .get('room')
-        ?.trim()
-        .toUpperCase();
+    restoringRef.current = true;
+    const roomPath = `rooms/${stored.roomCode}`;
+    const playerPath = `rooms/${stored.roomCode}/players/${stored.playerId}`;
 
-      if (stored && (!urlRoom || urlRoom === stored.roomCode)) {
-        try {
-          const data = await postJson<{
-            room: RoomSnapshot;
-            playerId: string;
-            playerToken: string;
-          }>(
-            `${resolveApiBase()}/api/rooms/${encodeURIComponent(
-              stored.roomCode
-            )}/reconnect`,
-            { playerToken: stored.playerToken }
-          );
-          if (!unmountedRef.current) {
-            applyJoinedRoom(data.room, data.playerId, data.playerToken);
-          }
-        } catch (err) {
-          const code = (err as { code?: string })?.code;
-          if (code === 'ROOM_NOT_FOUND' || code === 'SESSION_EXPIRED') {
-            writeStoredSession(null);
-          }
-        }
-      }
-    };
-
-    const connect = () => {
-      if (unmountedRef.current) return;
-      if (
-        wsRef.current &&
-        (wsRef.current.readyState === WebSocket.OPEN ||
-          wsRef.current.readyState === WebSocket.CONNECTING)
-      ) {
-        return;
-      }
-
-      if (!httpReachableRef.current) {
-        setConnectionStatus('connecting');
-      }
-
-      let ws: WebSocket;
+    (async () => {
       try {
-        ws = new WebSocket(resolveWebSocketUrl());
-      } catch {
-        if (!httpReachableRef.current) {
-          setConnectionStatus('disconnected');
-          setConnectionFailed(true);
-        }
-        return;
-      }
-      wsRef.current = ws;
+        const [roomSnap, playerSnap] = await Promise.all([
+          getDoc(doc(db, 'rooms', stored.roomCode)),
+          getDoc(doc(db, 'rooms', stored.roomCode, 'players', stored.playerId)),
+        ]);
 
-      ws.onopen = () => {
-        if (unmountedRef.current) {
-          ws.close();
-          return;
-        }
-        reconnectAttemptRef.current = 0;
-        setConnectionStatus('connected');
-        setConnectionFailed(false);
-
-        const activeCode = roomCodeRef.current;
-        const activeToken = playerTokenRef.current;
-        if (activeCode && activeToken) {
-          ws.send(
-            JSON.stringify({
-              type: 'room:reconnect',
-              roomCode: activeCode,
-              playerToken: activeToken,
-            } satisfies ClientMessage)
-          );
-          return;
-        }
-
-        const stored = readStoredSession();
-        const urlRoom = new URLSearchParams(window.location.search)
-          .get('room')
-          ?.trim()
-          .toUpperCase();
-
-        if (stored && (!urlRoom || urlRoom === stored.roomCode)) {
-          ws.send(
-            JSON.stringify({
-              type: 'room:reconnect',
-              roomCode: stored.roomCode,
-              playerToken: stored.playerToken,
-            } satisfies ClientMessage)
-          );
-        }
-      };
-
-      ws.onmessage = (event) => {
-        let msg: ServerMessage;
-        try {
-          msg = JSON.parse(event.data as string) as ServerMessage;
-        } catch {
-          return;
-        }
-
-        switch (msg.type) {
-          case 'room:joined': {
-            applyJoinedRoom(msg.room, msg.playerId, msg.playerToken);
-            break;
-          }
-          case 'room:state': {
-            setRoom(msg.room);
-            break;
-          }
-          case 'room:left': {
-            clearRoomSession();
-            break;
-          }
-          case 'room:error': {
-            setError(msg.message);
-            if (
-              msg.code === 'ROOM_NOT_FOUND' ||
-              msg.code === 'SESSION_EXPIRED'
-            ) {
-              clearRoomSession();
-            }
-            break;
-          }
-          case 'pong':
-            break;
-        }
-      };
-
-      ws.onclose = () => {
-        wsRef.current = null;
         if (unmountedRef.current) return;
 
-        if (!httpReachableRef.current) {
-          probeHealth().then((ok) => {
-            if (!unmountedRef.current && !ok) {
-              setConnectionStatus('disconnected');
-              if (reconnectAttemptRef.current >= 1) {
-                setConnectionFailed(true);
-              }
-            }
-          });
+        if (roomSnap.exists() && playerSnap.exists()) {
+          applySession(stored.roomCode, stored.playerId, stored.playerName);
+        } else {
+          writeStoredSession(null);
         }
-
-        const delay = Math.min(1500 * 2 ** reconnectAttemptRef.current, 10000);
-        reconnectAttemptRef.current += 1;
-        reconnectTimerRef.current = window.setTimeout(connect, delay);
-      };
-
-      ws.onerror = () => {
-        // onclose handles fallback & reconnection
-      };
-    };
-
-    connectFnRef.current = connect;
-    probeHealth().then((ok) => {
-      if (ok && !unmountedRef.current && !roomCodeRef.current) {
-        tryHttpReconnect();
-      }
-    });
-    connect();
-
-    pingInterval = window.setInterval(() => {
-      if (wsRef.current?.readyState === WebSocket.OPEN) {
-        wsRef.current.send(JSON.stringify({ type: 'ping' }));
-      }
-    }, 25000);
-
-    // HTTP polling fallback whenever WS is not OPEN and user is inside a room
-    pollInterval = window.setInterval(async () => {
-      if (unmountedRef.current) return;
-      if (wsRef.current?.readyState === WebSocket.OPEN) return;
-      const code = roomCodeRef.current;
-      const token = playerTokenRef.current;
-      if (!code || !token) return;
-
-      try {
-        const res = await fetch(
-          `${resolveApiBase()}/api/rooms/${encodeURIComponent(
-            code
-          )}/state?token=${encodeURIComponent(token)}`
-        );
-        if (res.status === 404 || res.status === 401) {
-          const data = (await res.json().catch(() => null)) as {
-            message?: string;
-          } | null;
-          clearRoomSession();
-          if (data?.message) setError(data.message);
-          return;
+      } catch (err) {
+        if (isPermissionDeniedError(err)) {
+          reportError(err, OperationType.GET, `${roomPath} | ${playerPath}`, '');
         }
-        if (res.ok) {
-          const data = (await res.json()) as {
-            room: RoomSnapshot;
-            playerId: string;
-          };
-          if (!unmountedRef.current && data.room) {
-            httpReachableRef.current = true;
-            setConnectionStatus('connected');
-            setConnectionFailed(false);
-            setRoom(data.room);
-          }
-        }
-      } catch {
-        // Transient network hiccup
+      } finally {
+        restoringRef.current = false;
       }
-    }, 900);
+    })();
 
     return () => {
       unmountedRef.current = true;
-      connectFnRef.current = null;
-      if (reconnectTimerRef.current !== null) {
-        window.clearTimeout(reconnectTimerRef.current);
-      }
-      if (pingInterval !== null) {
-        window.clearInterval(pingInterval);
-      }
-      if (pollInterval !== null) {
-        window.clearInterval(pollInterval);
-      }
-      if (wsRef.current) {
-        wsRef.current.close();
-        wsRef.current = null;
-      }
     };
-  }, [enabled, applyJoinedRoom, clearRoomSession, probeHealth]);
+  }, [enabled, activeSession, applySession, reportError]);
 
-  const reconnectNow = useCallback(() => {
-    if (reconnectTimerRef.current !== null) {
-      window.clearTimeout(reconnectTimerRef.current);
-      reconnectTimerRef.current = null;
+  // Attach real-time Firestore listeners for active room and players
+  useEffect(() => {
+    if (!enabled || !activeSession) {
+      return;
     }
-    reconnectAttemptRef.current = 0;
-    setConnectionFailed(false);
-    probeHealth();
-    connectFnRef.current?.();
-  }, [probeHealth]);
+
+    const { roomCode, playerId } = activeSession;
+    const roomPath = `rooms/${roomCode}`;
+    const playersPath = `rooms/${roomCode}/players`;
+
+    const unsubRoom = onSnapshot(
+      doc(db, 'rooms', roomCode),
+      (snapshot) => {
+        if (!snapshot.exists()) {
+          if (hasLoadedRoomRef.current) {
+            clearRoomSession();
+            setError('Oda kapatıldı.');
+          }
+          return;
+        }
+        hasLoadedRoomRef.current = true;
+        const data = snapshot.data() as FirestoreRoomDoc;
+        setRoomDoc(data);
+
+        if (
+          Array.isArray(data.playerOrder) &&
+          !data.playerOrder.includes(playerId)
+        ) {
+          clearRoomSession();
+          setError('Odadan çıkarıldın.');
+        }
+      },
+      (err) => {
+        try {
+          handleFirestoreError(err, OperationType.GET, roomPath);
+        } catch (wrapped) {
+          setFatalError(
+            wrapped instanceof Error ? wrapped : new Error(String(wrapped))
+          );
+        }
+      }
+    );
+
+    const unsubPlayers = onSnapshot(
+      query(
+        collection(db, 'rooms', roomCode, 'players'),
+        where('roomCode', '==', roomCode)
+      ),
+      (snapshot) => {
+        const list = snapshot.docs.map(
+          (d) => d.data() as FirestorePlayerDoc
+        );
+        setPlayerDocs(list);
+      },
+      (err) => {
+        try {
+          handleFirestoreError(err, OperationType.LIST, playersPath);
+        } catch (wrapped) {
+          setFatalError(
+            wrapped instanceof Error ? wrapped : new Error(String(wrapped))
+          );
+        }
+      }
+    );
+
+    return () => {
+      unsubRoom();
+      unsubPlayers();
+    };
+  }, [enabled, activeSession, clearRoomSession]);
+
+  // Host transitions SHUFFLING -> next step or RESULTS after 1400ms
+  useEffect(() => {
+    if (
+      !enabled ||
+      !activeSession ||
+      !roomDoc ||
+      roomDoc.screen !== 'SHUFFLING' ||
+      roomDoc.hostId !== activeSession.playerId
+    ) {
+      return;
+    }
+
+    const roomCode = roomDoc.code;
+    const stepIndex = roomDoc.currentStepIndex;
+    const currentDocs = playerDocs;
+
+    const timer = window.setTimeout(async () => {
+      const roomRef = doc(db, 'rooms', roomCode);
+      const roomPath = `rooms/${roomCode}`;
+
+      try {
+        if (stepIndex + 1 < GAME_STEPS.length) {
+          await runTransaction(db, async (tx) => {
+            const snap = await tx.get(roomRef);
+            if (!snap.exists()) return;
+            const latest = snap.data() as FirestoreRoomDoc;
+            if (
+              latest.screen !== 'SHUFFLING' ||
+              latest.currentStepIndex !== stepIndex
+            ) {
+              return;
+            }
+            tx.update(roomRef, {
+              screen: 'PLAYING',
+              currentStepIndex: stepIndex + 1,
+              updatedAt: serverTimestamp(),
+            });
+          });
+        } else {
+          const answersPath = `rooms/${roomCode}/answers`;
+          const answersSnap = await getDocs(
+            query(
+              collection(db, 'rooms', roomCode, 'answers'),
+              where('roomCode', '==', roomCode)
+            )
+          );
+          const answerDocs = answersSnap.docs.map(
+            (d) => d.data() as FirestoreAnswerDoc
+          );
+          const orderedPlayers = orderRoomPlayers(
+            roomDoc.playerOrder,
+            currentDocs,
+            roomDoc.hostId
+          );
+          if (orderedPlayers.length < 2) {
+            return;
+          }
+          const answersMap = buildAnswersMapFromDocs(answerDocs);
+          const builtResults = buildSentences(orderedPlayers, answersMap);
+
+          await runTransaction(db, async (tx) => {
+            const snap = await tx.get(roomRef);
+            if (!snap.exists()) return;
+            const latest = snap.data() as FirestoreRoomDoc;
+            if (
+              latest.screen !== 'SHUFFLING' ||
+              latest.currentStepIndex !== 3
+            ) {
+              return;
+            }
+            tx.update(roomRef, {
+              screen: 'RESULTS',
+              results: builtResults,
+              updatedAt: serverTimestamp(),
+            });
+          });
+          void answersPath;
+        }
+      } catch (err) {
+        reportError(
+          err,
+          OperationType.UPDATE,
+          roomPath,
+          'Sonraki aşamaya geçilirken bir sorun oluştu.'
+        );
+      }
+    }, 1400);
+
+    return () => window.clearTimeout(timer);
+  }, [enabled, activeSession, roomDoc, playerDocs, reportError]);
+
+  const room: RoomSnapshot | null = useMemo(() => {
+    if (!roomDoc) return null;
+    const players = orderRoomPlayers(
+      roomDoc.playerOrder ?? [],
+      playerDocs,
+      roomDoc.hostId
+    );
+    const submittedPlayerIds = computeSubmittedPlayerIds(
+      roomDoc.playerOrder ?? [],
+      playerDocs,
+      roomDoc.currentStepIndex
+    );
+
+    return {
+      code: roomDoc.code,
+      hostId: roomDoc.hostId,
+      screen: roomDoc.screen,
+      players,
+      currentStepIndex: roomDoc.currentStepIndex,
+      submittedPlayerIds,
+      results: roomDoc.results ?? [],
+    };
+  }, [roomDoc, playerDocs]);
 
   const clearError = useCallback(() => setError(null), []);
 
-  const sendRoomAction = useCallback(
-    async (action: ClientMessage) => {
-      const ws = wsRef.current;
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify(action));
-        return;
-      }
+  const maybeAdvanceToShuffling = useCallback(
+    async (roomCode: string, expectedStepIndex: number) => {
+      const roomRef = doc(db, 'rooms', roomCode);
+      await runTransaction(db, async (tx) => {
+        const roomSnap = await tx.get(roomRef);
+        if (!roomSnap.exists()) return;
+        const latestRoom = roomSnap.data() as FirestoreRoomDoc;
+        if (
+          latestRoom.screen !== 'PLAYING' ||
+          latestRoom.currentStepIndex !== expectedStepIndex
+        ) {
+          return;
+        }
 
-      const code = roomCodeRef.current;
-      const token = playerTokenRef.current;
-      if (!code || !token) return;
-
-      try {
-        const data = await postJson<{
-          room?: RoomSnapshot | null;
-          left?: boolean;
-        }>(
-          `${resolveApiBase()}/api/rooms/${encodeURIComponent(code)}/action`,
-          { playerToken: token, action }
+        const pSnaps = await Promise.all(
+          latestRoom.playerOrder.map((pid) =>
+            tx.get(doc(db, 'rooms', roomCode, 'players', pid))
+          )
         );
-        httpReachableRef.current = true;
-        setConnectionFailed(false);
-        setConnectionStatus('connected');
-        if (data.left) {
-          clearRoomSession();
-        } else if (data.room) {
-          setRoom(data.room);
+        const latestDocs = pSnaps
+          .filter((s) => s.exists())
+          .map((s) => s.data() as FirestorePlayerDoc);
+
+        if (
+          areAllPlayersSubmitted(
+            latestRoom.playerOrder,
+            latestDocs,
+            expectedStepIndex
+          )
+        ) {
+          tx.update(roomRef, {
+            screen: 'SHUFFLING',
+            updatedAt: serverTimestamp(),
+          });
         }
-      } catch (err) {
-        const message =
-          err instanceof Error ? err.message : 'Sunucuyla bağlantı kurulamadı.';
-        setError(message);
-        const errCode = (err as { code?: string })?.code;
-        if (errCode === 'ROOM_NOT_FOUND' || errCode === 'SESSION_EXPIRED') {
-          clearRoomSession();
-        }
-      }
+      });
     },
-    [clearRoomSession]
+    []
   );
 
   const createRoom = useCallback(
-    async (playerName: string) => {
-      setError(null);
-      playerNameRef.current = playerName.trim();
-
-      const ws = wsRef.current;
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(
-          JSON.stringify({
-            type: 'room:create',
-            playerName,
-          } satisfies ClientMessage)
-        );
+    async (rawName: string) => {
+      const cleanName = sanitizePlayerName(rawName);
+      if (!cleanName) {
+        setError('Lütfen önce oyuncu adını yaz.');
         return;
       }
 
+      setError(null);
+      setIsBusy(true);
+      const playerId = createRoomPlayerId();
+
       try {
-        const data = await postJson<{
-          room: RoomSnapshot;
-          playerId: string;
-          playerToken: string;
-        }>(`${resolveApiBase()}/api/rooms`, { playerName });
-        httpReachableRef.current = true;
-        applyJoinedRoom(data.room, data.playerId, data.playerToken);
-      } catch (err) {
-        const isRoomError = Boolean((err as { code?: string })?.code);
-        if (!isRoomError) {
-          setConnectionFailed(true);
-          setError(
-            'Sunucuya bağlanılamadı. Tek cihaz modunu kullanabilir veya internet bağlantını kontrol edebilirsin.'
-          );
-        } else {
-          setError(err instanceof Error ? err.message : 'Oda kurulamadı.');
+        let createdCode = '';
+        for (let attempt = 0; attempt < 5; attempt++) {
+          const candidate = generateRoomCode();
+          const roomRef = doc(db, 'rooms', candidate);
+          const existing = await getDoc(roomRef);
+          if (!existing.exists()) {
+            const batch = writeBatch(db);
+            batch.set(roomRef, {
+              code: candidate,
+              hostId: playerId,
+              screen: 'LOBBY',
+              currentStepIndex: 0,
+              playerOrder: [playerId],
+              results: [],
+              createdAt: serverTimestamp(),
+              updatedAt: serverTimestamp(),
+            });
+            batch.set(doc(db, 'rooms', candidate, 'players', playerId), {
+              id: playerId,
+              roomCode: candidate,
+              name: cleanName,
+              isHost: true,
+              submittedStepIndex: -1,
+              joinedAt: serverTimestamp(),
+              updatedAt: serverTimestamp(),
+            });
+            await batch.commit();
+            createdCode = candidate;
+            break;
+          }
         }
+
+        if (!createdCode) {
+          throw new RoomDomainError(
+            'Oda kodu oluşturulamadı, lütfen tekrar dene.'
+          );
+        }
+
+        applySession(createdCode, playerId, cleanName);
+      } catch (err) {
+        reportError(
+          err,
+          OperationType.CREATE,
+          'rooms',
+          'Oda kurulurken bir sorun oluştu. İnternet bağlantını kontrol edip tekrar dene.'
+        );
+      } finally {
+        setIsBusy(false);
       }
     },
-    [applyJoinedRoom]
+    [applySession, reportError]
   );
 
   const joinRoom = useCallback(
-    async (roomCode: string, playerName: string) => {
-      setError(null);
-      const normalized = roomCode.trim().toUpperCase();
-      playerNameRef.current = playerName.trim();
-      const stored = readStoredSession();
-      const token =
-        stored && stored.roomCode === normalized
-          ? stored.playerToken
-          : undefined;
+    async (rawCode: string, rawName: string) => {
+      const cleanName = sanitizePlayerName(rawName);
+      const code = normalizeRoomCode(rawCode);
 
-      const ws = wsRef.current;
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(
-          JSON.stringify({
-            type: 'room:join',
-            roomCode: normalized,
-            playerName,
-            playerToken: token,
-          } satisfies ClientMessage)
-        );
+      if (!cleanName) {
+        setError('Katılmak için önce oyuncu adını yaz.');
+        return;
+      }
+      if (!isValidRoomCode(code)) {
+        setError('Lütfen 6 karakterli geçerli bir oda kodu yaz.');
         return;
       }
 
+      setError(null);
+      setIsBusy(true);
+      const roomPath = `rooms/${code}`;
+
       try {
-        const data = await postJson<{
-          room: RoomSnapshot;
-          playerId: string;
-          playerToken: string;
-        }>(`${resolveApiBase()}/api/rooms/join`, {
-          roomCode: normalized,
-          playerName,
-          playerToken: token,
-        });
-        httpReachableRef.current = true;
-        applyJoinedRoom(data.room, data.playerId, data.playerToken);
-      } catch (err) {
-        const isRoomError = Boolean((err as { code?: string })?.code);
-        if (!isRoomError) {
-          setConnectionFailed(true);
-          setError(
-            'Sunucuya bağlanılamadı. Tek cihaz modunu kullanabilir veya internet bağlantını kontrol edebilirsin.'
+        const stored = readStoredSession();
+        if (stored && stored.roomCode === code) {
+          const existingPlayerRef = doc(
+            db,
+            'rooms',
+            code,
+            'players',
+            stored.playerId
           );
-        } else {
-          setError(err instanceof Error ? err.message : 'Odaya katılınamadı.');
+          const [roomSnap, playerSnap] = await Promise.all([
+            getDoc(doc(db, 'rooms', code)),
+            getDoc(existingPlayerRef),
+          ]);
+          if (roomSnap.exists() && playerSnap.exists()) {
+            const pData = playerSnap.data() as FirestorePlayerDoc;
+            if (pData.name !== cleanName) {
+              await runTransaction(db, async (tx) => {
+                tx.update(existingPlayerRef, {
+                  name: cleanName,
+                  updatedAt: serverTimestamp(),
+                });
+              });
+            }
+            applySession(code, stored.playerId, cleanName);
+            return;
+          }
         }
+
+        const newPlayerId = createRoomPlayerId();
+        const roomRef = doc(db, 'rooms', code);
+        const playerRef = doc(db, 'rooms', code, 'players', newPlayerId);
+
+        await runTransaction(db, async (tx) => {
+          const roomSnap = await tx.get(roomRef);
+          if (!roomSnap.exists()) {
+            throw new RoomDomainError('Oda bulunamadı. Kodu kontrol et.');
+          }
+
+          const latest = roomSnap.data() as FirestoreRoomDoc;
+          if (latest.screen !== 'LOBBY') {
+            throw new RoomDomainError(
+              'Oyun zaten başladı. Yeni turda katılabilirsin.'
+            );
+          }
+          if (latest.playerOrder.length >= MAX_ROOM_PLAYERS) {
+            throw new RoomDomainError(
+              `Oda dolu (en fazla ${MAX_ROOM_PLAYERS} kişi).`
+            );
+          }
+
+          tx.set(playerRef, {
+            id: newPlayerId,
+            roomCode: code,
+            name: cleanName,
+            isHost: false,
+            submittedStepIndex: -1,
+            joinedAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+          tx.update(roomRef, {
+            playerOrder: [...latest.playerOrder, newPlayerId],
+            updatedAt: serverTimestamp(),
+          });
+        });
+
+        applySession(code, newPlayerId, cleanName);
+      } catch (err) {
+        reportError(
+          err,
+          OperationType.WRITE,
+          roomPath,
+          'Odaya katılırken bir sorun oluştu. Lütfen tekrar dene.'
+        );
+      } finally {
+        setIsBusy(false);
       }
     },
-    [applyJoinedRoom]
+    [applySession, reportError]
   );
 
-  const leaveRoom = useCallback(() => {
-    setError(null);
-    const ws = wsRef.current;
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: 'room:leave' } satisfies ClientMessage));
+  const leaveRoom = useCallback(async () => {
+    if (!activeSession) {
       clearRoomSession();
       return;
     }
-    const code = roomCodeRef.current;
-    const token = playerTokenRef.current;
+
+    const { roomCode, playerId } = activeSession;
+    const roomPath = `rooms/${roomCode}`;
     clearRoomSession();
-    if (code && token) {
-      postJson(`${resolveApiBase()}/api/rooms/${encodeURIComponent(code)}/action`, {
-        playerToken: token,
-        action: { type: 'room:leave' },
-      }).catch(() => {});
+
+    try {
+      const roomRef = doc(db, 'rooms', roomCode);
+      const roomSnap = await getDoc(roomRef);
+      if (!roomSnap.exists()) return;
+
+      const latest = roomSnap.data() as FirestoreRoomDoc;
+      if (latest.playerOrder.length <= 1 && latest.playerOrder.includes(playerId)) {
+        const answersSnap = await getDocs(
+          query(
+            collection(db, 'rooms', roomCode, 'answers'),
+            where('roomCode', '==', roomCode)
+          )
+        );
+        const batch = writeBatch(db);
+        for (const ans of answersSnap.docs) {
+          batch.delete(ans.ref);
+        }
+        batch.delete(doc(db, 'rooms', roomCode, 'players', playerId));
+        batch.delete(roomRef);
+        await batch.commit();
+        return;
+      }
+
+      await runTransaction(db, async (tx) => {
+        const snap = await tx.get(roomRef);
+        if (!snap.exists()) return;
+        const curr = snap.data() as FirestoreRoomDoc;
+        const nextOrder = curr.playerOrder.filter((id) => id !== playerId);
+        if (nextOrder.length === 0) return;
+
+        const nextHostId =
+          curr.hostId === playerId ? nextOrder[0] : curr.hostId;
+
+        if (nextHostId !== curr.hostId) {
+          tx.update(doc(db, 'rooms', roomCode, 'players', nextHostId), {
+            isHost: true,
+            updatedAt: serverTimestamp(),
+          });
+        }
+
+        tx.delete(doc(db, 'rooms', roomCode, 'players', playerId));
+        tx.update(roomRef, {
+          playerOrder: nextOrder,
+          hostId: nextHostId,
+          updatedAt: serverTimestamp(),
+        });
+      });
+    } catch (err) {
+      reportError(
+        err,
+        OperationType.DELETE,
+        roomPath,
+        'Odadan ayrılırken bir sorun oluştu.'
+      );
     }
-  }, [clearRoomSession]);
+  }, [activeSession, clearRoomSession, reportError]);
 
   const renamePlayer = useCallback(
-    (name: string) => {
+    async (rawName: string) => {
+      if (!activeSession) return;
+      const cleanName = sanitizePlayerName(rawName);
+      if (!cleanName) return;
+
+      const { roomCode, playerId } = activeSession;
+      const playerPath = `rooms/${roomCode}/players/${playerId}`;
       setError(null);
-      playerNameRef.current = name.trim();
-      sendRoomAction({ type: 'player:rename', name });
+
+      try {
+        await runTransaction(db, async (tx) => {
+          tx.update(doc(db, 'rooms', roomCode, 'players', playerId), {
+            name: cleanName,
+            updatedAt: serverTimestamp(),
+          });
+        });
+        writeStoredSession({ roomCode, playerId, playerName: cleanName });
+      } catch (err) {
+        reportError(
+          err,
+          OperationType.UPDATE,
+          playerPath,
+          'Oyuncu adı güncellenemedi.'
+        );
+      }
     },
-    [sendRoomAction]
+    [activeSession, reportError]
   );
 
   const kickPlayer = useCallback(
-    (targetPlayerId: string) => {
+    async (targetPlayerId: string) => {
+      if (!activeSession || !roomDoc) return;
+      if (roomDoc.hostId !== activeSession.playerId) return;
+      if (targetPlayerId === activeSession.playerId) return;
+
+      const roomCode = activeSession.roomCode;
+      const roomPath = `rooms/${roomCode}`;
       setError(null);
-      sendRoomAction({ type: 'player:kick', targetPlayerId });
+
+      try {
+        let shouldCheckAdvance = false;
+        let activeStep = roomDoc.currentStepIndex;
+
+        await runTransaction(db, async (tx) => {
+          const roomRef = doc(db, 'rooms', roomCode);
+          const snap = await tx.get(roomRef);
+          if (!snap.exists()) return;
+          const latest = snap.data() as FirestoreRoomDoc;
+          const nextOrder = latest.playerOrder.filter(
+            (id) => id !== targetPlayerId
+          );
+          if (nextOrder.length === 0) return;
+
+          tx.delete(doc(db, 'rooms', roomCode, 'players', targetPlayerId));
+          tx.update(roomRef, {
+            playerOrder: nextOrder,
+            updatedAt: serverTimestamp(),
+          });
+          shouldCheckAdvance = latest.screen === 'PLAYING';
+          activeStep = latest.currentStepIndex;
+        });
+
+        if (shouldCheckAdvance) {
+          await maybeAdvanceToShuffling(roomCode, activeStep);
+        }
+      } catch (err) {
+        reportError(
+          err,
+          OperationType.DELETE,
+          roomPath,
+          'Oyuncu çıkarılamadı.'
+        );
+      }
     },
-    [sendRoomAction]
+    [activeSession, roomDoc, maybeAdvanceToShuffling, reportError]
   );
 
-  const startGame = useCallback(() => {
+  const startGame = useCallback(async () => {
+    if (!activeSession || !roomDoc) return;
+    if (roomDoc.hostId !== activeSession.playerId) return;
+    if (roomDoc.playerOrder.length < 2) {
+      setError('Başlamak için en az 2 oyuncu gerekli.');
+      return;
+    }
+
+    const roomCode = activeSession.roomCode;
+    const roomPath = `rooms/${roomCode}`;
     setError(null);
-    sendRoomAction({ type: 'game:start' });
-  }, [sendRoomAction]);
+
+    try {
+      const answersSnap = await getDocs(
+        query(
+          collection(db, 'rooms', roomCode, 'answers'),
+          where('roomCode', '==', roomCode)
+        )
+      );
+      const batch = writeBatch(db);
+      for (const ans of answersSnap.docs) {
+        batch.delete(ans.ref);
+      }
+      for (const pid of roomDoc.playerOrder) {
+        batch.update(doc(db, 'rooms', roomCode, 'players', pid), {
+          submittedStepIndex: -1,
+          updatedAt: serverTimestamp(),
+        });
+      }
+      batch.update(doc(db, 'rooms', roomCode), {
+        screen: 'PLAYING',
+        currentStepIndex: 0,
+        results: [],
+        updatedAt: serverTimestamp(),
+      });
+      await batch.commit();
+    } catch (err) {
+      reportError(
+        err,
+        OperationType.UPDATE,
+        roomPath,
+        'Oyun başlatılamadı. Lütfen tekrar dene.'
+      );
+    }
+  }, [activeSession, roomDoc, reportError]);
 
   const submitAnswer = useCallback(
-    (text: string) => {
+    async (rawText: string) => {
+      if (!activeSession || !roomDoc) return;
+      if (roomDoc.screen !== 'PLAYING') return;
+
+      const cleanText = sanitizeAnswerText(rawText);
+      if (!cleanText) return;
+
+      const { roomCode, playerId } = activeSession;
+      const stepIndex = roomDoc.currentStepIndex;
+      const step = GAME_STEPS[stepIndex];
+      if (!step) return;
+
+      const answerId = `${step.key}_${playerId}`;
+      const answerPath = `rooms/${roomCode}/answers/${answerId}`;
       setError(null);
-      sendRoomAction({ type: 'answer:submit', text });
+
+      try {
+        const batch = writeBatch(db);
+        batch.set(doc(db, 'rooms', roomCode, 'answers', answerId), {
+          roomCode,
+          stepKey: step.key,
+          playerId,
+          text: cleanText,
+          updatedAt: serverTimestamp(),
+        });
+        batch.update(doc(db, 'rooms', roomCode, 'players', playerId), {
+          submittedStepIndex: stepIndex,
+          updatedAt: serverTimestamp(),
+        });
+        await batch.commit();
+
+        await maybeAdvanceToShuffling(roomCode, stepIndex);
+      } catch (err) {
+        reportError(
+          err,
+          OperationType.WRITE,
+          answerPath,
+          'Cevap gönderilemedi. Lütfen tekrar dene.'
+        );
+      }
     },
-    [sendRoomAction]
+    [activeSession, roomDoc, maybeAdvanceToShuffling, reportError]
   );
 
-  const reshuffle = useCallback(() => {
-    setError(null);
-    sendRoomAction({ type: 'game:reshuffle' });
-  }, [sendRoomAction]);
+  const reshuffle = useCallback(async () => {
+    if (!activeSession || !roomDoc) return;
+    if (roomDoc.hostId !== activeSession.playerId) return;
+    if (roomDoc.screen !== 'RESULTS') return;
 
-  const resetToLobby = useCallback(() => {
+    const roomCode = activeSession.roomCode;
+    const roomPath = `rooms/${roomCode}`;
     setError(null);
-    sendRoomAction({ type: 'game:reset' });
-  }, [sendRoomAction]);
+
+    try {
+      const answersSnap = await getDocs(
+        query(
+          collection(db, 'rooms', roomCode, 'answers'),
+          where('roomCode', '==', roomCode)
+        )
+      );
+      const answerDocs = answersSnap.docs.map(
+        (d) => d.data() as FirestoreAnswerDoc
+      );
+      const orderedPlayers = orderRoomPlayers(
+        roomDoc.playerOrder,
+        playerDocs,
+        roomDoc.hostId
+      );
+      if (orderedPlayers.length < 2) return;
+
+      const builtResults = buildSentences(
+        orderedPlayers,
+        buildAnswersMapFromDocs(answerDocs)
+      );
+
+      await runTransaction(db, async (tx) => {
+        const roomRef = doc(db, 'rooms', roomCode);
+        const snap = await tx.get(roomRef);
+        if (!snap.exists()) return;
+        const latest = snap.data() as FirestoreRoomDoc;
+        if (latest.screen !== 'RESULTS') return;
+
+        tx.update(roomRef, {
+          results: builtResults,
+          updatedAt: serverTimestamp(),
+        });
+      });
+    } catch (err) {
+      reportError(
+        err,
+        OperationType.UPDATE,
+        roomPath,
+        'Cümleler karıştırılamadı.'
+      );
+    }
+  }, [activeSession, roomDoc, playerDocs, reportError]);
+
+  const resetToLobby = useCallback(async () => {
+    if (!activeSession || !roomDoc) return;
+    if (roomDoc.hostId !== activeSession.playerId) return;
+
+    const roomCode = activeSession.roomCode;
+    const roomPath = `rooms/${roomCode}`;
+    setError(null);
+
+    try {
+      const answersSnap = await getDocs(
+        query(
+          collection(db, 'rooms', roomCode, 'answers'),
+          where('roomCode', '==', roomCode)
+        )
+      );
+      const batch = writeBatch(db);
+      for (const ans of answersSnap.docs) {
+        batch.delete(ans.ref);
+      }
+      for (const pid of roomDoc.playerOrder) {
+        batch.update(doc(db, 'rooms', roomCode, 'players', pid), {
+          submittedStepIndex: -1,
+          updatedAt: serverTimestamp(),
+        });
+      }
+      batch.update(doc(db, 'rooms', roomCode), {
+        screen: 'LOBBY',
+        currentStepIndex: 0,
+        results: [],
+        updatedAt: serverTimestamp(),
+      });
+      await batch.commit();
+    } catch (err) {
+      reportError(
+        err,
+        OperationType.UPDATE,
+        roomPath,
+        'Lobiye dönülemedi.'
+      );
+    }
+  }, [activeSession, roomDoc, reportError]);
 
   return {
-    connectionStatus,
-    connectionFailed,
     room,
-    myPlayerId,
+    myPlayerId: activeSession?.playerId ?? null,
+    isBusy,
     error,
     clearError,
-    reconnectNow,
     createRoom,
     joinRoom,
     leaveRoom,
