@@ -412,11 +412,13 @@ export default function App() {
                 {isOnline ? (
                   <OnlineLobby
                     connectionStatus={mp.connectionStatus}
+                    connectionFailed={mp.connectionFailed}
                     room={onlineRoom}
                     myPlayerId={mp.myPlayerId}
                     initialRoomCode={initialQuery.roomCode}
                     error={mp.error}
                     onClearError={mp.clearError}
+                    onReconnect={mp.reconnectNow}
                     onCreateRoom={mp.createRoom}
                     onJoinRoom={mp.joinRoom}
                     onLeaveRoom={mp.leaveRoom}

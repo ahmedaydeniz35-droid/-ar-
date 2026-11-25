@@ -70,6 +70,7 @@ function updateUrlRoomParam(roomCode: string | null) {
 export function useMultiplayerRoom(enabled: boolean) {
   const [connectionStatus, setConnectionStatus] =
     useState<ConnectionStatus>('disconnected');
+  const [connectionFailed, setConnectionFailed] = useState(false);
   const [room, setRoom] = useState<RoomSnapshot | null>(null);
   const [myPlayerId, setMyPlayerId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -80,6 +81,7 @@ export function useMultiplayerRoom(enabled: boolean) {
   const reconnectAttemptRef = useRef(0);
   const unmountedRef = useRef(false);
   const playerNameRef = useRef('');
+  const connectFnRef = useRef<(() => void) | null>(null);
 
   const sendMessage = useCallback((msg: ClientMessage) => {
     const ws = wsRef.current;
@@ -87,6 +89,18 @@ export function useMultiplayerRoom(enabled: boolean) {
       ws.send(JSON.stringify(msg));
     } else {
       pendingQueueRef.current.push(msg);
+      if (
+        !ws ||
+        ws.readyState === WebSocket.CLOSED ||
+        ws.readyState === WebSocket.CLOSING
+      ) {
+        if (reconnectTimerRef.current !== null) {
+          window.clearTimeout(reconnectTimerRef.current);
+          reconnectTimerRef.current = null;
+        }
+        reconnectAttemptRef.current = 0;
+        connectFnRef.current?.();
+      }
     }
   }, []);
 
@@ -109,7 +123,14 @@ export function useMultiplayerRoom(enabled: boolean) {
       }
 
       setConnectionStatus('connecting');
-      const ws = new WebSocket(resolveWebSocketUrl());
+      let ws: WebSocket;
+      try {
+        ws = new WebSocket(resolveWebSocketUrl());
+      } catch {
+        setConnectionStatus('disconnected');
+        setConnectionFailed(true);
+        return;
+      }
       wsRef.current = ws;
 
       ws.onopen = () => {
@@ -119,8 +140,8 @@ export function useMultiplayerRoom(enabled: boolean) {
         }
         reconnectAttemptRef.current = 0;
         setConnectionStatus('connected');
+        setConnectionFailed(false);
 
-        // Auto-reconnect to stored session if no explicit join/create queued
         const hasPendingRoomAction = pendingQueueRef.current.some(
           (m) => m.type === 'room:create' || m.type === 'room:join'
         );
@@ -207,6 +228,10 @@ export function useMultiplayerRoom(enabled: boolean) {
         if (unmountedRef.current) return;
         setConnectionStatus('disconnected');
 
+        if (reconnectAttemptRef.current >= 1) {
+          setConnectionFailed(true);
+        }
+
         const delay = Math.min(1000 * 2 ** reconnectAttemptRef.current, 5000);
         reconnectAttemptRef.current += 1;
         reconnectTimerRef.current = window.setTimeout(connect, delay);
@@ -217,6 +242,7 @@ export function useMultiplayerRoom(enabled: boolean) {
       };
     };
 
+    connectFnRef.current = connect;
     connect();
     pingInterval = window.setInterval(() => {
       if (wsRef.current?.readyState === WebSocket.OPEN) {
@@ -226,6 +252,7 @@ export function useMultiplayerRoom(enabled: boolean) {
 
     return () => {
       unmountedRef.current = true;
+      connectFnRef.current = null;
       if (reconnectTimerRef.current !== null) {
         window.clearTimeout(reconnectTimerRef.current);
       }
@@ -238,6 +265,16 @@ export function useMultiplayerRoom(enabled: boolean) {
       }
     };
   }, [enabled]);
+
+  const reconnectNow = useCallback(() => {
+    if (reconnectTimerRef.current !== null) {
+      window.clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
+    reconnectAttemptRef.current = 0;
+    setConnectionFailed(false);
+    connectFnRef.current?.();
+  }, []);
 
   const clearError = useCallback(() => setError(null), []);
 
@@ -320,10 +357,12 @@ export function useMultiplayerRoom(enabled: boolean) {
 
   return {
     connectionStatus,
+    connectionFailed,
     room,
     myPlayerId,
     error,
     clearError,
+    reconnectNow,
     createRoom,
     joinRoom,
     leaveRoom,
